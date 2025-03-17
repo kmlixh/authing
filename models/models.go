@@ -39,7 +39,7 @@ type RolePermission struct {
 // UserRole 用户角色关联表
 type UserRole struct {
 	ID        int64     `json:"id" gom:"primary_key"`
-	UserID    int64     `json:"user_id" gom:"not null"`          // 用户ID
+	UserID    string    `json:"user_id" gom:"not null"`          // 用户ID
 	RoleID    int64     `json:"role_id" gom:"not null"`          // 角色ID
 	CreatedAt time.Time `json:"created_at" gom:"autoCreateTime"` // 创建时间
 	UpdatedAt time.Time `json:"updated_at" gom:"autoUpdateTime"` // 更新时间
@@ -48,7 +48,7 @@ type UserRole struct {
 // UserPermission 用户权限表
 type UserPermission struct {
 	ID           int64     `json:"id" gom:"primary_key"`
-	UserID       int64     `json:"user_id" gom:"not null"`          // 用户ID
+	UserID       string    `json:"user_id" gom:"not null"`          // 用户ID
 	PermissionID int64     `json:"permission_id" gom:"not null"`    // 权限ID
 	ExpiredAt    time.Time `json:"expired_at" gom:"null"`           // 权限过期时间
 	CreatedAt    time.Time `json:"created_at" gom:"autoCreateTime"` // 创建时间
@@ -63,14 +63,4 @@ type RouteWhitelist struct {
 	IPList    string    `json:"ip_list" gom:"size:1000"`         // 允许访问的IP列表，多个IP用逗号分隔
 	CreatedAt time.Time `json:"created_at" gom:"autoCreateTime"` // 创建时间
 	UpdatedAt time.Time `json:"updated_at" gom:"autoUpdateTime"` // 更新时间
-}
-
-// User 用户表
-type User struct {
-	ID        int64     `json:"id" gom:"primary_key"`
-	Username  string    `json:"username" gom:"size:100;not null;unique"` // 用户名
-	Password  string    `json:"-" gom:"size:255;not null"`               // 密码
-	IsEnabled bool      `json:"is_enabled" gom:"default:true"`           // 是否启用
-	CreatedAt time.Time `json:"created_at" gom:"autoCreateTime"`         // 创建时间
-	UpdatedAt time.Time `json:"updated_at" gom:"autoUpdateTime"`         // 更新时间
 }

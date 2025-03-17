@@ -5,8 +5,9 @@ import (
 
 	"authing"
 
-	"github.com/gofiber/fiber/v2"
 	"github.com/kmlixh/gom/v4/define"
+
+	"github.com/gofiber/fiber/v2"
 )
 
 func main() {
@@ -25,7 +26,7 @@ func main() {
 		},
 	}
 
-	authService, err := authing.NewAuthService(config)
+	authService, err := authing.NewAuthTool(config)
 	if err != nil {
 		log.Fatalf("Failed to initialize auth service: %v", err)
 	}
@@ -39,10 +40,15 @@ func main() {
 	// 受保护的路由
 	app.Get("/api/protected", func(c *fiber.Ctx) error {
 		// 从上下文中获取用户信息
-		user := authService.GetUserFromContext(c)
+		userId, err := authService.ValidateToken(c.Context(), c.Get("Authorization"))
+		if err != nil {
+			return c.Status(fiber.StatusUnauthorized).JSON(fiber.Map{
+				"message": "Unauthorized",
+			})
+		}
 		return c.JSON(fiber.Map{
 			"message": "Protected route accessed successfully",
-			"user":    user,
+			"user":    userId,
 		})
 	})
 
