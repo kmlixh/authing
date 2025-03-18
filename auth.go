@@ -89,7 +89,7 @@ func (s *AuthTool) ValidateToken(ctx context.Context, token string) (string, err
 // CheckPermission 检查用户是否有权限访问指定路由
 func (s *AuthTool) CheckPermission(ctx context.Context, userID string, route string) (bool, error) {
 	// 1. 检查路由是否在白名单中
-	whitelisted, err := s.checkRouteWhitelist(ctx, route)
+	whitelisted, err := s.checkRouteWhitelist(route)
 	if err != nil {
 		return false, err
 	}
@@ -104,7 +104,7 @@ func (s *AuthTool) CheckPermission(ctx context.Context, userID string, route str
 	}
 
 	// 3. 从Redis缓存中获取用户权限
-	redisKey := fmt.Sprintf("user_permissions_%d", userID)
+	redisKey := fmt.Sprintf("user_permissions_%s", userID)
 	if permissions, err := s.redisClient.Get(ctx, redisKey).Result(); err == nil {
 		var permissionList []models.Permission
 		if err := json.Unmarshal([]byte(permissions), &permissionList); err == nil {
@@ -113,18 +113,18 @@ func (s *AuthTool) CheckPermission(ctx context.Context, userID string, route str
 		}
 	}
 
-	// 4. 从数据库获取用户权限
-	permissions, err := s.getUserPermissionsFromDB(ctx, userID)
-	if err != nil {
+	// 4. 从数据库获取用户权限并缓存
+	if err := s.CacheUserPermissions(ctx, userID); err != nil {
 		return false, err
 	}
 
-	// 更新缓存
-	s.userPermissionsCache.Store(userID, permissions)
-	permissionsJSON, _ := json.Marshal(permissions)
-	s.redisClient.Set(ctx, fmt.Sprintf("user_permissions_%d", userID), permissionsJSON, s.permissionCacheDuration)
+	// 从缓存中获取权限（此时缓存已更新）
+	if permissions, ok := s.userPermissionsCache.Load(userID); ok {
+		permissionList := permissions.([]models.Permission)
+		return s.matchRoute(permissionList, route), nil
+	}
 
-	return s.matchRoute(permissions, route), nil
+	return false, fmt.Errorf("failed to get user permissions")
 }
 
 // CacheUserPermissions 缓存用户权限信息
@@ -150,7 +150,7 @@ func (s *AuthTool) AuthMiddleware() fiber.Handler {
 	return func(c *fiber.Ctx) error {
 		// 检查路由是否在白名单中
 		route := c.Path()
-		whitelisted, err := s.checkRouteWhitelist(c.Context(), route)
+		whitelisted, err := s.checkRouteWhitelist(route)
 		if err == nil && whitelisted {
 			return c.Next()
 		}
@@ -192,7 +192,7 @@ func (s *AuthTool) AuthMiddleware() fiber.Handler {
 // 内部辅助方法
 
 // checkRouteWhitelist 检查路由是否在白名单中
-func (s *AuthTool) checkRouteWhitelist(ctx context.Context, route string) (bool, error) {
+func (s *AuthTool) checkRouteWhitelist(route string) (bool, error) {
 	var whitelist models.RouteWhitelist
 	result := s.db.Chain().From(&whitelist).Where("route", define.OpEq, route).First(&whitelist)
 	if result.Error != nil {
@@ -221,6 +221,7 @@ func (s *AuthTool) getUserPermissionsFromDB(ctx context.Context, userId string) 
 
 	// 获取用户直接权限
 	result := s.db.Chain().
+		SetContext(ctx).
 		Table("user_permissions up").
 		Fields("p.*").
 		Join("JOIN permissions p ON up.permission_id = p.id").
@@ -234,6 +235,7 @@ func (s *AuthTool) getUserPermissionsFromDB(ctx context.Context, userId string) 
 	// 获取用户角色权限
 	var rolePermissions []models.Permission
 	result = s.db.Chain().
+		SetContext(ctx).
 		Table("user_roles ur").
 		Fields("DISTINCT p.*").
 		Join("JOIN role_permissions rp ON ur.role_id = rp.role_id").
@@ -252,7 +254,7 @@ func (s *AuthTool) getUserPermissionsFromDB(ctx context.Context, userId string) 
 // 以下是权限表的增删改查方法
 
 // CreatePermission 创建权限
-func (s *AuthTool) CreatePermission(ctx context.Context, permission *models.Permission) error {
+func (s *AuthTool) CreatePermission(permission *models.Permission) error {
 	result := s.db.Chain().From(permission).Insert(permission)
 	if result.Error != nil {
 		return result.Error
@@ -261,7 +263,7 @@ func (s *AuthTool) CreatePermission(ctx context.Context, permission *models.Perm
 }
 
 // GetPermissionByID 根据ID获取权限
-func (s *AuthTool) GetPermissionByID(ctx context.Context, id int64) (*models.Permission, error) {
+func (s *AuthTool) GetPermissionByID(id int64) (*models.Permission, error) {
 	var permission models.Permission
 	result := s.db.Chain().From(&permission).Where("id", define.OpEq, id).First(&permission)
 	if result.Error != nil {
@@ -271,7 +273,7 @@ func (s *AuthTool) GetPermissionByID(ctx context.Context, id int64) (*models.Per
 }
 
 // UpdatePermission 更新权限
-func (s *AuthTool) UpdatePermission(ctx context.Context, permission *models.Permission) error {
+func (s *AuthTool) UpdatePermission(permission *models.Permission) error {
 	result := s.db.Chain().From(permission).Where("id", define.OpEq, permission.ID).Update(permission)
 	if result.Error != nil {
 		return result.Error
@@ -280,7 +282,7 @@ func (s *AuthTool) UpdatePermission(ctx context.Context, permission *models.Perm
 }
 
 // DeletePermission 删除权限
-func (s *AuthTool) DeletePermission(ctx context.Context, id int64) error {
+func (s *AuthTool) DeletePermission(id int64) error {
 	result := s.db.Chain().From(&models.Permission{}).Where("id", define.OpEq, id).Delete()
 	if result.Error != nil {
 		return result.Error
@@ -289,7 +291,7 @@ func (s *AuthTool) DeletePermission(ctx context.Context, id int64) error {
 }
 
 // ListPermissions 获取权限列表
-func (s *AuthTool) ListPermissions(ctx context.Context, page, pageSize int) ([]models.Permission, int64, error) {
+func (s *AuthTool) ListPermissions(page, pageSize int) ([]models.Permission, int64, error) {
 	var permissions []models.Permission
 	chain := s.db.Chain().From(&models.Permission{})
 
@@ -311,7 +313,7 @@ func (s *AuthTool) ListPermissions(ctx context.Context, page, pageSize int) ([]m
 // 以下是角色表的增删改查方法
 
 // CreateRole 创建角色
-func (s *AuthTool) CreateRole(ctx context.Context, role *models.Role) error {
+func (s *AuthTool) CreateRole(role *models.Role) error {
 	result := s.db.Chain().From(role).Insert(role)
 	if result.Error != nil {
 		return result.Error
@@ -320,7 +322,7 @@ func (s *AuthTool) CreateRole(ctx context.Context, role *models.Role) error {
 }
 
 // GetRoleByID 根据ID获取角色
-func (s *AuthTool) GetRoleByID(ctx context.Context, id int64) (*models.Role, error) {
+func (s *AuthTool) GetRoleByID(id int64) (*models.Role, error) {
 	var role models.Role
 	result := s.db.Chain().From(&role).Where("id", define.OpEq, id).First(&role)
 	if result.Error != nil {
@@ -330,7 +332,7 @@ func (s *AuthTool) GetRoleByID(ctx context.Context, id int64) (*models.Role, err
 }
 
 // UpdateRole 更新角色
-func (s *AuthTool) UpdateRole(ctx context.Context, role *models.Role) error {
+func (s *AuthTool) UpdateRole(role *models.Role) error {
 	result := s.db.Chain().From(role).Where("id", define.OpEq, role.ID).Update(role)
 	if result.Error != nil {
 		return result.Error
@@ -339,7 +341,7 @@ func (s *AuthTool) UpdateRole(ctx context.Context, role *models.Role) error {
 }
 
 // DeleteRole 删除角色
-func (s *AuthTool) DeleteRole(ctx context.Context, id int64) error {
+func (s *AuthTool) DeleteRole(id int64) error {
 	result := s.db.Chain().From(&models.Role{}).Where("id", define.OpEq, id).Delete()
 	if result.Error != nil {
 		return result.Error
@@ -348,7 +350,7 @@ func (s *AuthTool) DeleteRole(ctx context.Context, id int64) error {
 }
 
 // ListRoles 获取角色列表
-func (s *AuthTool) ListRoles(ctx context.Context, page, pageSize int) ([]models.Role, int64, error) {
+func (s *AuthTool) ListRoles(page, pageSize int) ([]models.Role, int64, error) {
 	var roles []models.Role
 	chain := s.db.Chain().From(&models.Role{})
 
@@ -370,14 +372,14 @@ func (s *AuthTool) ListRoles(ctx context.Context, page, pageSize int) ([]models.
 // 以下是角色权限关联表的增删改查方法
 
 // AssignPermissionToRole 为角色分配权限
-func (s *AuthTool) AssignPermissionToRole(ctx context.Context, roleID, permissionID int64) error {
+func (s *AuthTool) AssignPermissionToRole(roleID, permissionID int64) error {
 	// 获取角色和权限信息
-	role, err := s.GetRoleByID(ctx, roleID)
+	role, err := s.GetRoleByID(roleID)
 	if err != nil {
 		return err
 	}
 
-	permission, err := s.GetPermissionByID(ctx, permissionID)
+	permission, err := s.GetPermissionByID(permissionID)
 	if err != nil {
 		return err
 	}
@@ -404,7 +406,7 @@ func (s *AuthTool) AssignPermissionToRole(ctx context.Context, roleID, permissio
 }
 
 // RemovePermissionFromRole 从角色中移除权限
-func (s *AuthTool) RemovePermissionFromRole(ctx context.Context, roleID, permissionID int64) error {
+func (s *AuthTool) RemovePermissionFromRole(roleID, permissionID int64) error {
 	result := s.db.Chain().From(&models.RolePermission{}).
 		Where("role_id", define.OpEq, roleID).
 		And("permission_id", define.OpEq, permissionID).
@@ -420,7 +422,7 @@ func (s *AuthTool) RemovePermissionFromRole(ctx context.Context, roleID, permiss
 	return nil
 }
 
-// GetRolePermissions 获取角色的所有权限
+// GetRolePermissions 获取角色的所有权限 (需要保留 ctx 用于缓存更新)
 func (s *AuthTool) GetRolePermissions(ctx context.Context, roleID int64) ([]models.Permission, error) {
 	// 先从缓存获取
 	if permissions, ok := s.rolePermissionsCache.Load(roleID); ok {
@@ -451,7 +453,7 @@ func (s *AuthTool) GetRolePermissions(ctx context.Context, roleID int64) ([]mode
 // AssignRoleToUser 为用户分配角色
 func (s *AuthTool) AssignRoleToUser(ctx context.Context, userId string, roleID int64) error {
 	// 获取角色信息，确保角色存在
-	_, err := s.GetRoleByID(ctx, roleID)
+	_, err := s.GetRoleByID(roleID)
 	if err != nil {
 		return err
 	}
@@ -477,7 +479,7 @@ func (s *AuthTool) AssignRoleToUser(ctx context.Context, userId string, roleID i
 }
 
 // RemoveRoleFromUser 从用户中移除角色
-func (s *AuthTool) RemoveRoleFromUser(ctx context.Context, userID, roleID int64) error {
+func (s *AuthTool) RemoveRoleFromUser(userID string, roleID int64) error {
 	result := s.db.Chain().From(&models.UserRole{}).
 		Where("user_id", define.OpEq, userID).
 		And("role_id", define.OpEq, roleID).
@@ -527,7 +529,7 @@ func (s *AuthTool) GetUserRoles(ctx context.Context, userId string) ([]models.Ro
 // AssignPermissionToUser 为用户分配直接权限
 func (s *AuthTool) AssignPermissionToUser(ctx context.Context, userId string, permissionID int64, expiredAt *time.Time) error {
 	// 获取权限信息，确保权限存在
-	_, err := s.GetPermissionByID(ctx, permissionID)
+	_, err := s.GetPermissionByID(permissionID)
 	if err != nil {
 		return err
 	}
@@ -629,7 +631,7 @@ func (s *AuthTool) UpdateRouteWhitelist(ctx context.Context, id int64, isAllowed
 }
 
 // DeleteRouteWhitelist 删除路由白名单
-func (s *AuthTool) DeleteRouteWhitelist(ctx context.Context, id int64) error {
+func (s *AuthTool) DeleteRouteWhitelist(id int64) error {
 	result := s.db.Chain().From(&models.RouteWhitelist{}).Where("id", define.OpEq, id).Delete()
 	if result.Error != nil {
 		return result.Error
@@ -639,7 +641,7 @@ func (s *AuthTool) DeleteRouteWhitelist(ctx context.Context, id int64) error {
 }
 
 // ListRouteWhitelists 获取路由白名单列表
-func (s *AuthTool) ListRouteWhitelists(ctx context.Context, page, pageSize int) ([]models.RouteWhitelist, int64, error) {
+func (s *AuthTool) ListRouteWhitelists(page, pageSize int) ([]models.RouteWhitelist, int64, error) {
 	var whitelists []models.RouteWhitelist
 	chain := s.db.Chain().From(&models.RouteWhitelist{})
 
@@ -682,14 +684,8 @@ func (s *AuthTool) SetToken(ctx context.Context, token string, userId string, us
 		return fmt.Errorf("invalid user id: %v", err)
 	}
 
-	// 获取并缓存用户权限
-	permissions, err := s.getUserPermissionsFromDB(ctx, userId)
-	if err != nil {
-		return fmt.Errorf("failed to get user permissions: %v", err)
-	}
-	s.userPermissionsCache.Store(userId, permissions)
-	permissionsJSON, _ := json.Marshal(permissions)
-	if err := s.redisClient.Set(ctx, fmt.Sprintf("user_permissions_%s", userId), permissionsJSON, s.permissionCacheDuration).Err(); err != nil {
+	// 缓存用户权限
+	if err := s.CacheUserPermissions(ctx, userId); err != nil {
 		return fmt.Errorf("failed to cache user permissions: %v", err)
 	}
 
