@@ -1,4 +1,4 @@
-module authing
+module github.com/kmlixh/authing
 
 go 1.23.0
 
