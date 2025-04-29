@@ -3,7 +3,8 @@ description:
 globs: 
 alwaysApply: true
 ---
-基础规约：
+返回任何结果和信息前，需要返回当前模型版本
+sql语句不允许有外键约束。
 此项目是基于golang的一个鉴权相关的工具项目，使用基于内存缓存+redis缓存+数据库配置的三级缓存来快速响应。http相关的操作使用的是Fiber，
 数据库操作使用的github.com/kmlixh/gom/v4@v4.6.3. 查询框架功能请用go doc
 

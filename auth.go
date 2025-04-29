@@ -859,3 +859,72 @@ func (s *AuthTool) GetRoles(ctx context.Context, page int, pageSize int, tenantI
 
 	return roles, total, nil
 }
+
+// CreateTenant 创建新租户
+func (s *AuthTool) CreateTenant(ctx context.Context, tenantID, name, description string) error {
+	tenant := models.NewTenant(tenantID, name, description)
+	result := s.db.Chain().Insert(tenant)
+	return result.Error
+}
+
+// GetTenant 获取租户信息
+func (s *AuthTool) GetTenant(ctx context.Context, tenantID string) (*models.Tenant, error) {
+	var tenant models.Tenant
+	result := s.db.Chain().Table(tenant.TableName()).
+		Where("tenant_id", define.OpEq, tenantID).
+		First(&tenant)
+
+	if result.Error != nil {
+		return nil, result.Error
+	}
+
+	return &tenant, nil
+}
+
+// UpdateTenant 更新租户信息
+func (s *AuthTool) UpdateTenant(ctx context.Context, tenant *models.Tenant) error {
+	tenant.UpdatedAt = time.Now()
+	result := s.db.Chain().Update(tenant)
+	return result.Error
+}
+
+// DeleteTenant 删除租户
+func (s *AuthTool) DeleteTenant(ctx context.Context, tenantID string) error {
+	tenant, err := s.GetTenant(ctx, tenantID)
+	if err != nil {
+		return err
+	}
+
+	result := s.db.Chain().Delete(tenant)
+	return result.Error
+}
+
+// GetTenants 获取租户列表
+func (s *AuthTool) GetTenants(ctx context.Context, page, pageSize int, condition map[string]interface{}) ([]models.Tenant, int64, error) {
+	var tenants []models.Tenant
+	var tenant models.Tenant
+
+	// 构建查询
+	chain := s.db.Chain().Table(tenant.TableName())
+
+	// 添加查询条件
+	if condition != nil {
+		for k, v := range condition {
+			chain = chain.Where(k, define.OpEq, v)
+		}
+	}
+
+	// 获取总数
+	total, err := chain.Count()
+	if err != nil {
+		return nil, 0, err
+	}
+
+	// 分页查询
+	result := chain.Offset((page - 1) * pageSize).Limit(pageSize).List(&tenants)
+	if result.Error != nil {
+		return nil, 0, result.Error
+	}
+
+	return tenants, total, nil
+}

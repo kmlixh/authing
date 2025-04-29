@@ -1,3 +1,14 @@
+-- 创建租户表
+CREATE TABLE IF NOT EXISTS tenants (
+    id BIGSERIAL PRIMARY KEY,
+    tenant_id VARCHAR(50) NOT NULL UNIQUE,
+    name VARCHAR(255) NOT NULL,
+    description TEXT,
+    is_enabled BOOLEAN DEFAULT true,
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+);
+
 -- 创建权限表
 CREATE TABLE IF NOT EXISTS permissions (
     id BIGSERIAL PRIMARY KEY,
@@ -69,7 +80,19 @@ CREATE TABLE IF NOT EXISTS user_permissions (
     UNIQUE(tenant_id, user_id, user_type, permission_id)
 );
 
+-- 创建路由白名单表
+CREATE TABLE IF NOT EXISTS route_whitelists (
+    id BIGSERIAL PRIMARY KEY,
+    route VARCHAR(255) NOT NULL,
+    is_allowed BOOLEAN DEFAULT TRUE,
+    ip_list TEXT,
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+);
+
 -- 创建索引
+CREATE INDEX IF NOT EXISTS idx_tenants_enabled ON tenants(is_enabled);
+
 CREATE INDEX IF NOT EXISTS idx_permissions_tenant ON permissions(tenant_id);
 CREATE INDEX IF NOT EXISTS idx_permissions_route ON permissions(route);
 CREATE INDEX IF NOT EXISTS idx_permissions_enabled ON permissions(is_enabled);
