@@ -8,7 +8,7 @@ import (
 	"sync"
 	"time"
 
-	"authing/models"
+	"github.com/kmlixh/authing/models"
 
 	"github.com/gofiber/fiber/v2"
 	"github.com/google/uuid"
