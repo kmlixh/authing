@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"regexp"
+	"strings"
 	"sync"
 	"time"
 
@@ -22,12 +23,15 @@ import (
 type AuthTool struct {
 	redisClient             *redis.Client
 	db                      *gom.DB
-	userRolesCache          sync.Map
-	userPermissionsCache    sync.Map
-	rolePermissionsCache    sync.Map
 	permissionCacheDuration time.Duration
 	config                  *Config
 	mu                      sync.RWMutex
+}
+
+// MiddlewareOptions 定义了认证中间件的配置选项
+type MiddlewareOptions struct {
+	// SkipRoutes 是一个路由前缀列表，匹配这些前缀的路由将绕过认证
+	SkipRoutes []string
 }
 
 // NewAuthTool 创建新的认证工具实例
@@ -67,24 +71,18 @@ func NewAuthTool(config *Config) (*AuthTool, error) {
 
 // ValidateToken 验证用户token
 func (s *AuthTool) ValidateToken(ctx context.Context, token string) (string, string, string, error) {
-	// 从Redis获取用户ID、类型和租户ID
-	userIdKey := fmt.Sprintf("user_id_%s", token)
-	userId, err := s.redisClient.Get(ctx, userIdKey).Result()
+	tokenKey := fmt.Sprintf("token:%s", token)
+	data, err := s.redisClient.HMGet(ctx, tokenKey, "user_id", "user_type", "tenant_id").Result()
 	if err != nil {
-		return "", "", "", fmt.Errorf("invalid token: %v", err)
+		return "", "", "", fmt.Errorf("failed to get token info from redis: %v", err)
+	}
+	if len(data) < 3 || data[0] == nil || data[1] == nil || data[2] == nil {
+		return "", "", "", fmt.Errorf("invalid or expired token")
 	}
 
-	userTypeKey := fmt.Sprintf("user_type_%s", token)
-	userType, err := s.redisClient.Get(ctx, userTypeKey).Result()
-	if err != nil {
-		return "", "", "", fmt.Errorf("invalid token: %v", err)
-	}
-
-	tenantIdKey := fmt.Sprintf("tenant_id_%s", token)
-	tenantId, err := s.redisClient.Get(ctx, tenantIdKey).Result()
-	if err != nil {
-		return "", "", "", fmt.Errorf("invalid token: %v", err)
-	}
+	userId := data[0].(string)
+	userType := data[1].(string)
+	tenantId := data[2].(string)
 
 	return userId, userType, tenantId, nil
 }
@@ -100,35 +98,35 @@ func (s *AuthTool) CheckPermission(ctx context.Context, userID string, userType 
 		return true, nil
 	}
 
-	// 2. 从内存缓存中获取用户权限
-	cacheKey := fmt.Sprintf("%s_%s_%s", tenantID, userType, userID)
-	if permissions, ok := s.userPermissionsCache.Load(cacheKey); ok {
-		permissionList := permissions.([]models.Permission)
-		return s.matchRoute(permissionList, route), nil
-	}
-
-	// 3. 从Redis缓存中获取用户权限
-	redisKey := fmt.Sprintf("user_permissions_%s_%s_%s", tenantID, userType, userID)
-	if permissions, err := s.redisClient.Get(ctx, redisKey).Result(); err == nil {
+	// 2. 从Redis缓存中获取用户权限
+	redisKey := fmt.Sprintf("user_permissions:%s:%s:%s", tenantID, userType, userID)
+	cachedPermissions, err := s.redisClient.Get(ctx, redisKey).Result()
+	if err == nil {
 		var permissionList []models.Permission
-		if err := json.Unmarshal([]byte(permissions), &permissionList); err == nil {
-			s.userPermissionsCache.Store(cacheKey, permissionList)
+		if err := json.Unmarshal([]byte(cachedPermissions), &permissionList); err == nil {
 			return s.matchRoute(permissionList, route), nil
 		}
 	}
 
-	// 4. 从数据库获取用户权限并缓存
-	if err := s.CacheUserPermissions(ctx, userID, userType, tenantID); err != nil {
-		return false, err
+	// 3. 从数据库获取用户权限并缓存
+	permissions, err := s.getUserPermissionsFromDB(ctx, userID, userType, tenantID)
+	if err != nil {
+		return false, fmt.Errorf("failed to get user permissions from db: %v", err)
 	}
 
-	// 从缓存中获取权限（此时缓存已更新）
-	if permissions, ok := s.userPermissionsCache.Load(cacheKey); ok {
-		permissionList := permissions.([]models.Permission)
-		return s.matchRoute(permissionList, route), nil
+	// 缓存到Redis
+	permissionsJSON, err := json.Marshal(permissions)
+	if err != nil {
+		return false, fmt.Errorf("failed to marshal permissions: %v", err)
+	}
+	err = s.redisClient.Set(ctx, redisKey, permissionsJSON, s.permissionCacheDuration).Err()
+	if err != nil {
+		// 即使缓存失败，也应该继续完成本次权限检查
+		fmt.Printf("Warning: failed to cache user permissions for user %s: %v
+", userID, err)
 	}
 
-	return false, fmt.Errorf("failed to get user permissions")
+	return s.matchRoute(permissions, route), nil
 }
 
 // CacheUserPermissions 缓存用户权限信息
@@ -138,26 +136,30 @@ func (s *AuthTool) CacheUserPermissions(ctx context.Context, userId string, user
 		return err
 	}
 
-	// 更新内存缓存
-	cacheKey := fmt.Sprintf("%s_%s_%s", tenantID, userType, userId)
-	s.userPermissionsCache.Store(cacheKey, permissions)
-
 	// 更新Redis缓存
 	permissionsJSON, err := json.Marshal(permissions)
 	if err != nil {
 		return err
 	}
-	redisKey := fmt.Sprintf("user_permissions_%s_%s_%s", tenantID, userType, userId)
+	redisKey := fmt.Sprintf("user_permissions:%s:%s:%s", tenantID, userType, userId)
 	return s.redisClient.Set(ctx, redisKey, permissionsJSON, s.permissionCacheDuration).Err()
 }
 
-// AuthMiddleware 认证中间件
-func (s *AuthTool) AuthMiddleware() fiber.Handler {
+// NewAuthMiddleware 创建一个新的、可配置的认证中间件
+func (s *AuthTool) NewAuthMiddleware(opts *MiddlewareOptions) fiber.Handler {
 	return func(c *fiber.Ctx) error {
-		// 获取请求路径
 		route := c.Path()
 
-		// 检查路由白名单
+		// 检查应用层传入的跳过路由列表
+		if opts != nil {
+			for _, skipRoute := range opts.SkipRoutes {
+				if strings.HasPrefix(route, skipRoute) {
+					return c.Next()
+				}
+			}
+		}
+
+		// 检查库配置的全局白名单
 		whitelisted, err := s.checkRouteWhitelist(route)
 		if err != nil {
 			return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
@@ -204,6 +206,12 @@ func (s *AuthTool) AuthMiddleware() fiber.Handler {
 
 		return c.Next()
 	}
+}
+
+// AuthMiddleware 提供一个默认的认证中间件，用于向后兼容
+func (s *AuthTool) AuthMiddleware() fiber.Handler {
+	// 调用新的中间件构造函数，不带任何跳过选项
+	return s.NewAuthMiddleware(nil)
 }
 
 // 内部辅助方法
@@ -290,10 +298,80 @@ func (s *AuthTool) getUserPermissionsFromDB(ctx context.Context, userId string, 
 	return permissions, nil
 }
 
+// clearUserPermissionsCache 清除单个用户的权限缓存
+func (s *AuthTool) clearUserPermissionsCache(ctx context.Context, tenantID, userID, userType string) error {
+	redisKey := fmt.Sprintf("user_permissions:%s:%s:%s", tenantID, userID, userType)
+	return s.redisClient.Del(ctx, redisKey).Err()
+}
+
+// clearUsersPermissionsCacheByRole 清除拥有特定角色的所有用户的权限缓存
+func (s *AuthTool) clearUsersPermissionsCacheByRole(ctx context.Context, roleID int64) error {
+	var userRoles []models.UserRole
+	result := s.db.Chain().From(&models.UserRole{}).Where("role_id", define.OpEq, roleID).List(&userRoles)
+	if result.Error != nil {
+		return result.Error
+	}
+
+	if len(userRoles) == 0 {
+		return nil
+	}
+
+	// 使用pipeline批量删除
+	pipe := s.redisClient.Pipeline()
+	for _, ur := range userRoles {
+		redisKey := fmt.Sprintf("user_permissions:%s:%s:%s", ur.TenantID, ur.UserID, ur.UserType)
+		pipe.Del(ctx, redisKey)
+	}
+	_, err := pipe.Exec(ctx)
+	return err
+}
+
+// clearUsersPermissionsCacheByPermission 清除拥有特定直接权限的所有用户的权限缓存
+func (s *AuthTool) clearUsersPermissionsCacheByPermission(ctx context.Context, permissionID int64) error {
+	// 1. 清除直接拥有该权限的用户缓存
+	var userPermissions []models.UserPermission
+	result := s.db.Chain().From(&models.UserPermission{}).Where("permission_id", define.OpEq, permissionID).List(&userPermissions)
+	if result.Error != nil {
+		return result.Error
+	}
+
+	pipe := s.redisClient.Pipeline()
+	for _, up := range userPermissions {
+		redisKey := fmt.Sprintf("user_permissions:%s:%s:%s", up.TenantID, up.UserID, up.UserType)
+		pipe.Del(ctx, redisKey)
+	}
+
+	// 2. 清除通过角色拥有该权限的用户缓存
+	var rolePermissions []models.RolePermission
+	result = s.db.Chain().From(&models.RolePermission{}).Where("permission_id", define.OpEq, permissionID).List(&rolePermissions)
+	if result.Error != nil {
+		return result.Error
+	}
+
+	for _, rp := range rolePermissions {
+		var userRoles []models.UserRole
+		result := s.db.Chain().From(&models.UserRole{}).Where("role_id", define.OpEq, rp.RoleID).List(&userRoles)
+		if result.Error != nil {
+			// 记录错误但继续
+			fmt.Printf("Warning: failed to get users for role %d: %v
+", rp.RoleID, result.Error)
+			continue
+		}
+		for _, ur := range userRoles {
+			redisKey := fmt.Sprintf("user_permissions:%s:%s:%s", ur.TenantID, ur.UserID, ur.UserType)
+			pipe.Del(ctx, redisKey)
+		}
+	}
+
+	_, err := pipe.Exec(ctx)
+	return err
+}
+
+
 // 以下是权限表的增删改查方法
 
 // CreatePermission 创建权限
-func (s *AuthTool) CreatePermission(permission *models.Permission) error {
+func (s *AuthTool) CreatePermission(ctx context.Context, permission *models.Permission) error {
 	result := s.db.Chain().From(permission).Insert(permission)
 	if result.Error != nil {
 		return result.Error
@@ -302,7 +380,7 @@ func (s *AuthTool) CreatePermission(permission *models.Permission) error {
 }
 
 // GetPermissionByID 根据ID获取权限
-func (s *AuthTool) GetPermissionByID(id int64) (*models.Permission, error) {
+func (s *AuthTool) GetPermissionByID(ctx context.Context, id int64) (*models.Permission, error) {
 	var permission models.Permission
 	result := s.db.Chain().From(&permission).Where("id", define.OpEq, id).First(&permission)
 	if result.Error != nil {
@@ -312,16 +390,22 @@ func (s *AuthTool) GetPermissionByID(id int64) (*models.Permission, error) {
 }
 
 // UpdatePermission 更新权限
-func (s *AuthTool) UpdatePermission(permission *models.Permission) error {
+func (s *AuthTool) UpdatePermission(ctx context.Context, permission *models.Permission) error {
 	result := s.db.Chain().From(permission).Where("id", define.OpEq, permission.ID).Update(permission)
 	if result.Error != nil {
 		return result.Error
 	}
-	return nil
+	// 清除与此权限相关的用户缓存
+	return s.clearUsersPermissionsCacheByPermission(ctx, permission.ID)
 }
 
 // DeletePermission 删除权限
-func (s *AuthTool) DeletePermission(id int64) error {
+func (s *AuthTool) DeletePermission(ctx context.Context, id int64) error {
+	// 先清除缓存，再删除数据
+	err := s.clearUsersPermissionsCacheByPermission(ctx, id)
+	if err != nil {
+		return fmt.Errorf("failed to clear user permissions cache before deleting permission: %v", err)
+	}
 	result := s.db.Chain().From(&models.Permission{}).Where("id", define.OpEq, id).Delete()
 	if result.Error != nil {
 		return result.Error
@@ -352,7 +436,7 @@ func (s *AuthTool) ListPermissions(page, pageSize int) ([]models.Permission, int
 // 以下是角色表的增删改查方法
 
 // CreateRole 创建角色
-func (s *AuthTool) CreateRole(role *models.Role) error {
+func (s *AuthTool) CreateRole(ctx context.Context, role *models.Role) error {
 	result := s.db.Chain().From(role).Insert(role)
 	if result.Error != nil {
 		return result.Error
@@ -361,7 +445,7 @@ func (s *AuthTool) CreateRole(role *models.Role) error {
 }
 
 // GetRoleByID 根据ID获取角色
-func (s *AuthTool) GetRoleByID(id int64) (*models.Role, error) {
+func (s *AuthTool) GetRoleByID(ctx context.Context, id int64) (*models.Role, error) {
 	var role models.Role
 	result := s.db.Chain().From(&role).Where("id", define.OpEq, id).First(&role)
 	if result.Error != nil {
@@ -371,16 +455,22 @@ func (s *AuthTool) GetRoleByID(id int64) (*models.Role, error) {
 }
 
 // UpdateRole 更新角色
-func (s *AuthTool) UpdateRole(role *models.Role) error {
+func (s *AuthTool) UpdateRole(ctx context.Context, role *models.Role) error {
 	result := s.db.Chain().From(role).Where("id", define.OpEq, role.ID).Update(role)
 	if result.Error != nil {
 		return result.Error
 	}
-	return nil
+	// 如果角色名等信息更新，可能需要更新关联信息，但更重要的是清除拥有此角色的用户权限缓存
+	return s.clearUsersPermissionsCacheByRole(ctx, role.ID)
 }
 
 // DeleteRole 删除角色
-func (s *AuthTool) DeleteRole(id int64) error {
+func (s *AuthTool) DeleteRole(ctx context.Context, id int64) error {
+	// 先清除缓存
+	err := s.clearUsersPermissionsCacheByRole(ctx, id)
+	if err != nil {
+		return fmt.Errorf("failed to clear user permissions cache before deleting role: %v", err)
+	}
 	result := s.db.Chain().From(&models.Role{}).Where("id", define.OpEq, id).Delete()
 	if result.Error != nil {
 		return result.Error
@@ -411,14 +501,14 @@ func (s *AuthTool) ListRoles(page, pageSize int) ([]models.Role, int64, error) {
 // 以下是角色权限关联表的增删改查方法
 
 // AssignPermissionToRole 为角色分配权限
-func (s *AuthTool) AssignPermissionToRole(roleID, permissionID int64) error {
+func (s *AuthTool) AssignPermissionToRole(ctx context.Context, roleID, permissionID int64) error {
 	// 获取角色和权限信息
-	role, err := s.GetRoleByID(roleID)
+	role, err := s.GetRoleByID(ctx, roleID)
 	if err != nil {
 		return err
 	}
 
-	permission, err := s.GetPermissionByID(permissionID)
+	permission, err := s.GetPermissionByID(ctx, permissionID)
 	if err != nil {
 		return err
 	}
@@ -438,14 +528,12 @@ func (s *AuthTool) AssignPermissionToRole(roleID, permissionID int64) error {
 		return result.Error
 	}
 
-	// 清除缓存
-	s.rolePermissionsCache.Delete(roleID)
-
-	return nil
+	// 清除拥有该角色的所有用户的权限缓存
+	return s.clearUsersPermissionsCacheByRole(ctx, roleID)
 }
 
 // RemovePermissionFromRole 从角色中移除权限
-func (s *AuthTool) RemovePermissionFromRole(roleID, permissionID int64) error {
+func (s *AuthTool) RemovePermissionFromRole(ctx context.Context, roleID, permissionID int64) error {
 	result := s.db.Chain().From(&models.RolePermission{}).
 		Where("role_id", define.OpEq, roleID).
 		And("permission_id", define.OpEq, permissionID).
@@ -455,20 +543,13 @@ func (s *AuthTool) RemovePermissionFromRole(roleID, permissionID int64) error {
 		return result.Error
 	}
 
-	// 清除缓存
-	s.rolePermissionsCache.Delete(roleID)
-
-	return nil
+	// 清除拥有该角色的所有用户的权限缓存
+	return s.clearUsersPermissionsCacheByRole(ctx, roleID)
 }
 
-// GetRolePermissions 获取角色的所有权限 (需要保留 ctx 用于缓存更新)
+// GetRolePermissions 获取角色的所有权限
 func (s *AuthTool) GetRolePermissions(ctx context.Context, roleID int64) ([]models.Permission, error) {
-	// 先从缓存获取
-	if permissions, ok := s.rolePermissionsCache.Load(roleID); ok {
-		return permissions.([]models.Permission), nil
-	}
-
-	// 从数据库获取
+	// 此函数现在不直接被权限检查逻辑使用，可以不使用缓存或使用独立的Redis缓存
 	var permissions []models.Permission
 	result := s.db.Chain().
 		Table("role_permissions rp").
@@ -481,24 +562,22 @@ func (s *AuthTool) GetRolePermissions(ctx context.Context, roleID int64) ([]mode
 		return nil, result.Error
 	}
 
-	// 更新缓存
-	s.rolePermissionsCache.Store(roleID, permissions)
-
 	return permissions, nil
 }
 
 // 以下是用户角色关联表的增删改查方法
 
 // AssignRoleToUser 为用户分配角色
-func (s *AuthTool) AssignRoleToUser(ctx context.Context, userId string, userType string, roleID int64) error {
+func (s *AuthTool) AssignRoleToUser(ctx context.Context, tenantID, userId string, userType string, roleID int64) error {
 	// 获取角色信息，确保角色存在
-	_, err := s.GetRoleByID(roleID)
+	_, err := s.GetRoleByID(ctx, roleID)
 	if err != nil {
 		return err
 	}
 
 	// 创建用户角色关联
 	userRole := &models.UserRole{
+		TenantID:  tenantID,
 		UserID:    userId,
 		UserType:  userType,
 		RoleID:    roleID,
@@ -511,43 +590,30 @@ func (s *AuthTool) AssignRoleToUser(ctx context.Context, userId string, userType
 		return result.Error
 	}
 
-	// 清除缓存
-	cacheKey := fmt.Sprintf("%s_%s", userType, userId)
-	s.userRolesCache.Delete(cacheKey)
-	s.userPermissionsCache.Delete(cacheKey)
-
-	return nil
+	// 清除该用户的权限缓存
+	return s.clearUserPermissionsCache(ctx, tenantID, userId, userType)
 }
 
 // RemoveRoleFromUser 从用户中移除角色
-func (s *AuthTool) RemoveRoleFromUser(userID string, userType string, roleID int64) error {
+func (s *AuthTool) RemoveRoleFromUser(ctx context.Context, tenantID, userID string, userType string, roleID int64) error {
 	result := s.db.Chain().From(&models.UserRole{}).
 		Where("user_id", define.OpEq, userID).
 		And("user_type", define.OpEq, userType).
 		And("role_id", define.OpEq, roleID).
+		And("tenant_id", define.OpEq, tenantID).
 		Delete()
 
 	if result.Error != nil {
 		return result.Error
 	}
 
-	// 清除缓存
-	cacheKey := fmt.Sprintf("%s_%s", userType, userID)
-	s.userRolesCache.Delete(cacheKey)
-	s.userPermissionsCache.Delete(cacheKey)
-
-	return nil
+	// 清除该用户的权限缓存
+	return s.clearUserPermissionsCache(ctx, tenantID, userID, userType)
 }
 
 // GetUserRoles 获取用户的所有角色
 func (s *AuthTool) GetUserRoles(ctx context.Context, userId string, userType string, tenantID string) ([]models.Role, error) {
-	// 先从缓存获取
-	cacheKey := fmt.Sprintf("%s_%s_%s", tenantID, userType, userId)
-	if roles, ok := s.userRolesCache.Load(cacheKey); ok {
-		return roles.([]models.Role), nil
-	}
-
-	// 使用原始SQL查询获取用户角色
+	// 此函数不直接被权限检查逻辑使用，可以不使用缓存或使用独立的Redis缓存
 	sql := `
 		SELECT r.* FROM roles r
 		JOIN user_roles ur ON r.id = ur.role_id
@@ -568,29 +634,22 @@ func (s *AuthTool) GetUserRoles(ctx context.Context, userId string, userType str
 		return nil, err
 	}
 
-	// 更新缓存
-	s.userRolesCache.Store(cacheKey, roles)
-	rolesJSON, _ := json.Marshal(roles)
-	redisKey := fmt.Sprintf("user_roles_%s_%s_%s", tenantID, userType, userId)
-	if err := s.redisClient.Set(ctx, redisKey, rolesJSON, s.permissionCacheDuration).Err(); err != nil {
-		return nil, err
-	}
-
 	return roles, nil
 }
 
 // 以下是用户权限表的增删改查方法
 
 // AssignPermissionToUser 为用户分配直接权限
-func (s *AuthTool) AssignPermissionToUser(ctx context.Context, userId string, userType string, permissionID int64, expiredAt *time.Time) error {
+func (s *AuthTool) AssignPermissionToUser(ctx context.Context, tenantID, userId string, userType string, permissionID int64, expiredAt *time.Time) error {
 	// 获取权限信息，确保权限存在
-	_, err := s.GetPermissionByID(permissionID)
+	_, err := s.GetPermissionByID(ctx, permissionID)
 	if err != nil {
 		return err
 	}
 
 	// 创建用户权限关联
 	userPermission := &models.UserPermission{
+		TenantID:     tenantID,
 		UserID:       userId,
 		UserType:     userType,
 		PermissionID: permissionID,
@@ -608,30 +667,25 @@ func (s *AuthTool) AssignPermissionToUser(ctx context.Context, userId string, us
 		return result.Error
 	}
 
-	// 清除缓存
-	cacheKey := fmt.Sprintf("%s_%s", userType, userId)
-	s.userPermissionsCache.Delete(cacheKey)
-
-	return nil
+	// 清除该用户的权限缓存
+	return s.clearUserPermissionsCache(ctx, tenantID, userId, userType)
 }
 
 // RemovePermissionFromUser 从用户中移除直接权限
-func (s *AuthTool) RemovePermissionFromUser(ctx context.Context, userId string, userType string, permissionID int64) error {
+func (s *AuthTool) RemovePermissionFromUser(ctx context.Context, tenantID, userId string, userType string, permissionID int64) error {
 	result := s.db.Chain().From(&models.UserPermission{}).
 		Where("user_id", define.OpEq, userId).
 		And("user_type", define.OpEq, userType).
 		And("permission_id", define.OpEq, permissionID).
+		And("tenant_id", define.OpEq, tenantID).
 		Delete()
 
 	if result.Error != nil {
 		return result.Error
 	}
 
-	// 清除缓存
-	cacheKey := fmt.Sprintf("%s_%s", userType, userId)
-	s.userPermissionsCache.Delete(cacheKey)
-
-	return nil
+	// 清除该用户的权限缓存
+	return s.clearUserPermissionsCache(ctx, tenantID, userId, userType)
 }
 
 // GetUserDirectPermissions 获取用户的直接权限
@@ -723,51 +777,38 @@ func (s *AuthTool) ListRouteWhitelists(page, pageSize int) ([]models.RouteWhitel
 
 // SetToken 设置用户token并缓存相关信息
 func (s *AuthTool) SetToken(ctx context.Context, token string, userId string, userType string, tenantID string, userInfo any, timeSpan int64) error {
-	// 1. 存储用户ID、类型和租户ID
-	userIdKey := fmt.Sprintf("user_id_%s", token)
-	if err := s.redisClient.Set(ctx, userIdKey, userId, time.Duration(timeSpan)*time.Minute).Err(); err != nil {
-		return fmt.Errorf("failed to set user id: %v", err)
+	// 1. 使用Redis Hash聚合存储Token信息
+	tokenKey := fmt.Sprintf("token:%s", token)
+	tokenData := map[string]interface{}{
+		"user_id":   userId,
+		"user_type": userType,
+		"tenant_id": tenantID,
 	}
 
-	userTypeKey := fmt.Sprintf("user_type_%s", token)
-	if err := s.redisClient.Set(ctx, userTypeKey, userType, time.Duration(timeSpan)*time.Minute).Err(); err != nil {
-		return fmt.Errorf("failed to set user type: %v", err)
+	// 存储用户信息（如果提供）
+	if userInfo != nil {
+		userInfoJSON, err := json.Marshal(userInfo)
+		if err != nil {
+			return fmt.Errorf("failed to marshal user info: %v", err)
+		}
+		tokenData["user_info"] = userInfoJSON
 	}
 
-	tenantIDKey := fmt.Sprintf("tenant_id_%s", token)
-	if err := s.redisClient.Set(ctx, tenantIDKey, tenantID, time.Duration(timeSpan)*time.Minute).Err(); err != nil {
-		return fmt.Errorf("failed to set tenant id: %v", err)
+	if err := s.redisClient.HSet(ctx, tokenKey, tokenData).Err(); err != nil {
+		return fmt.Errorf("failed to set token info in redis: %v", err)
 	}
 
-	// 2. 存储用户信息
-	userInfoKey := fmt.Sprintf("user_info_%s", token)
-	userInfoJSON, err := json.Marshal(userInfo)
-	if err != nil {
-		return fmt.Errorf("failed to marshal user info: %v", err)
-	}
-	if err := s.redisClient.Set(ctx, userInfoKey, userInfoJSON, time.Duration(timeSpan)*time.Minute).Err(); err != nil {
-		return fmt.Errorf("failed to set user info: %v", err)
+	// 设置过期时间
+	expire := time.Duration(timeSpan) * time.Minute
+	if err := s.redisClient.Expire(ctx, tokenKey, expire).Err(); err != nil {
+		return fmt.Errorf("failed to set token expiration: %v", err)
 	}
 
-	// 3. 缓存用户权限信息
-	// 缓存用户权限
+	// 2. 预热用户权限缓存
 	if err := s.CacheUserPermissions(ctx, userId, userType, tenantID); err != nil {
-		return fmt.Errorf("failed to cache user permissions: %v", err)
-	}
-
-	// 获取并缓存用户角色
-	roles, err := s.GetUserRoles(ctx, userId, userType, tenantID)
-	if err != nil {
-		return fmt.Errorf("failed to get user roles: %v", err)
-	}
-
-	cacheKey := fmt.Sprintf("%s_%s_%s", tenantID, userType, userId)
-	s.userRolesCache.Store(cacheKey, roles)
-
-	rolesJSON, _ := json.Marshal(roles)
-	rolesCacheKey := fmt.Sprintf("user_roles_%s_%s_%s", tenantID, userType, userId)
-	if err := s.redisClient.Set(ctx, rolesCacheKey, rolesJSON, s.permissionCacheDuration).Err(); err != nil {
-		return fmt.Errorf("failed to cache user roles: %v", err)
+		// 记录错误但允许登录继续
+		fmt.Printf("Warning: failed to pre-cache user permissions for user %s: %v
+", userId, err)
 	}
 
 	return nil
@@ -789,10 +830,10 @@ func (s *AuthTool) GenerateToken(ctx context.Context, userId string, userType st
 
 // GetUserInfo 从Redis缓存中获取用户信息
 func (s *AuthTool) GetUserInfo(ctx context.Context, token string, userInfo any) error {
-	userInfoKey := fmt.Sprintf("user_info_%s", token)
-	userInfoJSON, err := s.redisClient.Get(ctx, userInfoKey).Result()
+	tokenKey := fmt.Sprintf("token:%s", token)
+	userInfoJSON, err := s.redisClient.HGet(ctx, tokenKey, "user_info").Result()
 	if err != nil {
-		return fmt.Errorf("failed to get user info: %v", err)
+		return fmt.Errorf("failed to get user info from redis: %v", err)
 	}
 
 	if err := json.Unmarshal([]byte(userInfoJSON), userInfo); err != nil {
@@ -928,3 +969,4 @@ func (s *AuthTool) GetTenants(ctx context.Context, page, pageSize int, condition
 
 	return tenants, total, nil
 }
+
