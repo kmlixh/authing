@@ -169,7 +169,7 @@ func (s *AuthTool) AuthMiddleware() fiber.Handler {
 		}
 
 		// 获取token
-		token := c.Get("Authorization")
+		token := c.Get("Token")
 		if token == "" {
 			return c.Status(fiber.StatusUnauthorized).JSON(fiber.Map{
 				"message": "Missing authorization token",
