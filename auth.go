@@ -122,8 +122,7 @@ func (s *AuthTool) CheckPermission(ctx context.Context, userID string, userType 
 	err = s.redisClient.Set(ctx, redisKey, permissionsJSON, s.permissionCacheDuration).Err()
 	if err != nil {
 		// 即使缓存失败，也应该继续完成本次权限检查
-		fmt.Printf("Warning: failed to cache user permissions for user %s: %v
-", userID, err)
+		fmt.Printf("Warning: failed to cache user permissions for user %s: %v", userID, err)
 	}
 
 	return s.matchRoute(permissions, route), nil
@@ -353,8 +352,7 @@ func (s *AuthTool) clearUsersPermissionsCacheByPermission(ctx context.Context, p
 		result := s.db.Chain().From(&models.UserRole{}).Where("role_id", define.OpEq, rp.RoleID).List(&userRoles)
 		if result.Error != nil {
 			// 记录错误但继续
-			fmt.Printf("Warning: failed to get users for role %d: %v
-", rp.RoleID, result.Error)
+			fmt.Printf("Warning: failed to get users for role %d: %v", rp.RoleID, result.Error)
 			continue
 		}
 		for _, ur := range userRoles {
@@ -366,7 +364,6 @@ func (s *AuthTool) clearUsersPermissionsCacheByPermission(ctx context.Context, p
 	_, err := pipe.Exec(ctx)
 	return err
 }
-
 
 // 以下是权限表的增删改查方法
 
@@ -807,8 +804,7 @@ func (s *AuthTool) SetToken(ctx context.Context, token string, userId string, us
 	// 2. 预热用户权限缓存
 	if err := s.CacheUserPermissions(ctx, userId, userType, tenantID); err != nil {
 		// 记录错误但允许登录继续
-		fmt.Printf("Warning: failed to pre-cache user permissions for user %s: %v
-", userId, err)
+		fmt.Printf("Warning: failed to pre-cache user permissions for user %s: %v", userId, err)
 	}
 
 	return nil
@@ -969,4 +965,3 @@ func (s *AuthTool) GetTenants(ctx context.Context, page, pageSize int, condition
 
 	return tenants, total, nil
 }
-
