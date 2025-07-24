@@ -9,11 +9,11 @@ type Permission struct {
 	ID        int64     `json:"id" gom:"id,@"`
 	TenantID  string    `json:"tenant_id" gom:"tenant_id"`
 	Name      string    `json:"name" gom:"name"`
-	Route     string    `json:"route" gom:"route"` // 修正：明确指定列名
+	Route     string    `json:"route" gom:"route"`           // 修正：明确指定列名
 	IsEnabled bool      `json:"is_enabled" gom:"is_enabled"` // 修正：明确指定列名
-	CreatedAt time.Time `json:"created_at" gom:"created_at,autoCreateTime"` // 修正：明确指定列名
-	UpdatedAt time.Time `json:"updated_at" gom:"updated_at,autoUpdateTime"` // 修正：明确指定列名
-	ExpiredAt time.Time `json:"expired_at" gom:"expired_at,null"`           // 修正：明确指定列名
+	CreatedAt time.Time `json:"created_at" gom:"created_at"` // 修正：明确指定列名
+	UpdatedAt time.Time `json:"updated_at" gom:"updated_at"` // 修正：明确指定列名
+	ExpiredAt time.Time `json:"expired_at" gom:"expired_at"` // 修正：明确指定列名
 }
 
 // Role 角色表
