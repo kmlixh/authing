@@ -256,15 +256,15 @@ func (s *AuthTool) getUserPermissionsFromDB(ctx context.Context, userId string, 
 	var permissions []models.Permission
 	now := time.Now()
 
-	// 优化后的SQL查询，合并了tenant_id的判断，并简化了参数
+	// 修正版SQL：使用正确的表名 (permissions, user_permissions, role_permissions, user_roles)
 	sql := `
 		SELECT p.*
-		FROM tb_permission p
+		FROM permissions p
 		WHERE p.tenant_id = $1 AND (
 			-- 直接用户权限
 			EXISTS (
 				SELECT 1
-				FROM tb_user_permission up
+				FROM user_permissions up
 				WHERE up.permission_id = p.id
 				  AND up.user_id = $2
 				  AND up.user_type = $3
@@ -274,8 +274,8 @@ func (s *AuthTool) getUserPermissionsFromDB(ctx context.Context, userId string, 
 			-- 通过角色继承的权限
 			OR EXISTS (
 				SELECT 1
-				FROM tb_role_permission rp
-				JOIN tb_user_role ur ON rp.role_id = ur.role_id
+				FROM role_permissions rp
+				JOIN user_roles ur ON rp.role_id = ur.role_id
 				WHERE rp.permission_id = p.id
 				  AND ur.user_id = $2
 				  AND ur.user_type = $3
