@@ -6,14 +6,14 @@ import (
 
 // Permission 权限规则表
 type Permission struct {
-	ID        int64     `json:"id" gom:"primary_key"`
-	TenantID  string    `json:"tenant_id" gom:"size:50;not null"` // 租户ID
-	Name      string    `json:"name" gom:"size:100;not null"`     // 权限名称
-	Route     string    `json:"route" gom:"size:255;not null"`    // 权限路由
-	IsEnabled bool      `json:"is_enabled" gom:"default:true"`    // 是否启用
-	CreatedAt time.Time `json:"created_at" gom:"autoCreateTime"`  // 创建时间
-	UpdatedAt time.Time `json:"updated_at" gom:"autoUpdateTime"`  // 更新时间
-	ExpiredAt time.Time `json:"expired_at" gom:"null"`            // 失效时间
+	ID        int64     `json:"id" gom:"id,@"`
+	TenantID  string    `json:"tenant_id" gom:"tenant_id"`
+	Name      string    `json:"name" gom:"name"`
+	Route     string    `json:"route" gom:"route"` // 修正：明确指定列名
+	IsEnabled bool      `json:"is_enabled" gom:"is_enabled"` // 修正：明确指定列名
+	CreatedAt time.Time `json:"created_at" gom:"created_at,autoCreateTime"` // 修正：明确指定列名
+	UpdatedAt time.Time `json:"updated_at" gom:"updated_at,autoUpdateTime"` // 修正：明确指定列名
+	ExpiredAt time.Time `json:"expired_at" gom:"expired_at,null"`           // 修正：明确指定列名
 }
 
 // Role 角色表
