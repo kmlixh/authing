@@ -256,25 +256,37 @@ func (s *AuthTool) getUserPermissionsFromDB(ctx context.Context, userId string, 
 	var permissions []models.Permission
 	now := time.Now()
 
-	// 使用原始SQL查询获取用户的权限，PostgreSQL使用$1,$2等形式的参数占位符
+	// 优化后的SQL查询，合并了tenant_id的判断，并简化了参数
 	sql := `
-		SELECT p.* FROM tb_permission p
-		JOIN tb_user_permission up ON p.id = up.permission_id
-		WHERE up.user_id = $1 AND up.user_type = $2 AND up.tenant_id = $3 AND p.tenant_id = $4
-		AND (up.expired_at IS NULL OR up.expired_at > $5)
-		
-		UNION
-		
-		SELECT p.* FROM tb_permission p
-		JOIN tb_role_permission rp ON p.id = rp.permission_id
-		JOIN tb_user_role ur ON rp.role_id = ur.role_id
-		WHERE ur.user_id = $6 AND ur.user_type = $7 AND ur.tenant_id = $8
-		AND rp.tenant_id = $9 AND p.tenant_id = $10
+		SELECT p.*
+		FROM tb_permission p
+		WHERE p.tenant_id = $1 AND (
+			-- 直接用户权限
+			EXISTS (
+				SELECT 1
+				FROM tb_user_permission up
+				WHERE up.permission_id = p.id
+				  AND up.user_id = $2
+				  AND up.user_type = $3
+				  AND up.tenant_id = $1
+				  AND (up.expired_at IS NULL OR up.expired_at > $4)
+			)
+			-- 通过角色继承的权限
+			OR EXISTS (
+				SELECT 1
+				FROM tb_role_permission rp
+				JOIN tb_user_role ur ON rp.role_id = ur.role_id
+				WHERE rp.permission_id = p.id
+				  AND ur.user_id = $2
+				  AND ur.user_type = $3
+				  AND ur.tenant_id = $1
+				  AND rp.tenant_id = $1
+			)
+		)
 	`
 
 	args := []interface{}{
-		userId, userType, tenantID, tenantID, now,
-		userId, userType, tenantID, tenantID, tenantID,
+		tenantID, userId, userType, now,
 	}
 
 	result := s.db.Chain().RawQuery(sql, args...)
