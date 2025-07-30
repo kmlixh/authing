@@ -114,14 +114,17 @@ func (s *AuthTool) CheckPermission(ctx context.Context, userID string, userType 
 	var permissionList []models.Permission
 	if permissions, ok := s.userPermissionsCache.Load(cacheKey); ok {
 		permissionList = permissions.([]models.Permission)
-	} else {
-		// 4. 从Redis缓存中获取用户权限规则
+	}
+
+	if len(permissionList) == 0 {
+
 		redisKey := fmt.Sprintf("user_permissions_%s_%s_%s", tenantID, userType, userID)
 		if permissionsStr, err := s.redisClient.Get(ctx, redisKey).Result(); err == nil {
 			if err := json.Unmarshal([]byte(permissionsStr), &permissionList); err == nil {
 				s.userPermissionsCache.Store(cacheKey, permissionList)
 			}
-		} else {
+		}
+		if len(permissionList) == 0 {
 			// 5. 从数据库获取用户权限并缓存
 			if err := s.CacheUserPermissions(ctx, userID, userType, tenantID); err != nil {
 				return false, err
