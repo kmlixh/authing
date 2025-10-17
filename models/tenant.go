@@ -6,13 +6,13 @@ import (
 
 // Tenant 租户模型
 type Tenant struct {
-	ID          int64     `json:"id" db:"id,pk"`
-	TenantID    string    `json:"tenant_id" db:"tenant_id"`
-	Name        string    `json:"name" db:"name"`
-	Description string    `json:"description" db:"description"`
-	IsEnabled   bool      `json:"is_enabled" db:"is_enabled"`
-	CreatedAt   time.Time `json:"created_at" db:"created_at"`
-	UpdatedAt   time.Time `json:"updated_at" db:"updated_at"`
+	ID          int64     `json:"id" gom:"id,pk"`
+	TenantID    string    `json:"tenant_id" gom:"tenant_id"`
+	Name        string    `json:"name" gom:"name"`
+	Description string    `json:"description" gom:"description"`
+	IsEnabled   bool      `json:"is_enabled" gom:"is_enabled"`
+	CreatedAt   time.Time `json:"created_at" gom:"created_at"`
+	UpdatedAt   time.Time `json:"updated_at" gom:"updated_at"`
 }
 
 // TableName 返回表名
