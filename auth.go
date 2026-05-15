@@ -128,10 +128,12 @@ func (s *AuthTool) CheckPermission(ctx context.Context, userID string, userType 
 
 	cacheKey := fmt.Sprintf("%s_%s_%s", tenantID, userType, userID)
 
-	// 2. 新增：检查用户专属的“快速通行”路由缓存
+	// 2. 检查用户专属的"快速通行"路由缓存
+	// Stage 6 fix #6:把内层 map 换成 *sync.Map,移除 fast-path 写路径上的全局
+	// s.mu.Lock 调用,降锁粒度 ↓ 全局锁,↓ 高并发下的 head-of-line 阻塞。
 	if allowedRoutes, ok := s.userAllowedRoutesCache.Load(cacheKey); ok {
-		if _, allowed := allowedRoutes.(map[string]struct{})[route]; allowed {
-			return true, nil // 命中缓存，直接通过
+		if _, allowed := allowedRoutes.(*sync.Map).Load(route); allowed {
+			return true, nil
 		}
 	}
 
@@ -164,17 +166,10 @@ func (s *AuthTool) CheckPermission(ctx context.Context, userID string, userType 
 
 	// 6. 匹配路由和权限规则
 	if s.matchRoute(permissionList, route) {
-		// 7. 新增：匹配成功，填充“快速通行”缓存
-		s.mu.Lock()
-		var allowedRoutes map[string]struct{}
-		if val, ok := s.userAllowedRoutesCache.Load(cacheKey); ok {
-			allowedRoutes = val.(map[string]struct{})
-		} else {
-			allowedRoutes = make(map[string]struct{})
-		}
-		allowedRoutes[route] = struct{}{}
-		s.userAllowedRoutesCache.Store(cacheKey, allowedRoutes)
-		s.mu.Unlock()
+		// 7. 命中后填快速通行缓存。LoadOrStore 保证多 goroutine 并发命中时只
+		// 创建一次内层 sync.Map,然后两边都 Store 到同一个 map。无需 s.mu。
+		inner, _ := s.userAllowedRoutesCache.LoadOrStore(cacheKey, &sync.Map{})
+		inner.(*sync.Map).Store(route, struct{}{})
 		return true, nil
 	}
 
@@ -258,43 +253,69 @@ func (s *AuthTool) AuthMiddleware() fiber.Handler {
 
 // 内部辅助方法
 
-// checkRouteWhitelist 检查路由是否在白名单中
+// checkRouteWhitelist 检查路由是否在白名单中。
+//
+// 顺序:
+//   1. 进程内黑名单(config.BlacklistRoutes)— 命中即拒
+//   2. 进程内白名单(config.WhitelistRoutes)— 命中即放行
+//   3. DB-backed route_whitelists 表 — Stage 6 修复:之前完全没读这张表
 func (s *AuthTool) checkRouteWhitelist(route string) (bool, error) {
 	s.mu.RLock()
-	defer s.mu.RUnlock()
+	black := s.config.BlacklistRoutes
+	white := s.config.WhitelistRoutes
+	s.mu.RUnlock()
 
-	// 检查黑名单
-	for _, blackRoute := range s.config.BlacklistRoutes {
+	for _, blackRoute := range black {
 		if matched, _ := regexp.MatchString(blackRoute, route); matched {
 			return false, nil
 		}
 	}
-
-	// 检查白名单
-	for _, whiteRoute := range s.config.WhitelistRoutes {
+	for _, whiteRoute := range white {
 		if matched, _ := regexp.MatchString(whiteRoute, route); matched {
 			return true, nil
+		}
+	}
+
+	// DB 表(允许运营时动态加白,无需重启)
+	if s.db != nil {
+		var rows []models.RouteWhitelist
+		err := s.db.Chain().Table("route_whitelists").List(&rows).Into(&rows)
+		if err == nil {
+			for _, r := range rows {
+				if !r.IsAllowed {
+					continue
+				}
+				if matched, _ := regexp.MatchString(r.Route, route); matched {
+					return true, nil
+				}
+			}
 		}
 	}
 
 	return false, nil
 }
 
-// matchRoute 匹配路由和权限规则
+// matchRoute 匹配路由和权限规则。
+//
+// 性能优化(Stage 6 fix):分两遍。第一遍只做精确字符串相等,第二遍才走
+// regexp。原实现在循环里"先精确再正则",对每条规则都付出 regexp 编译/匹配
+// 成本,即便后面有精确命中也已经先做了正则。在权限规则多的场景显著影响 RPS。
 func (s *AuthTool) matchRoute(permissions []models.Permission, route string) bool {
+	// Pass 1: 全部精确匹配
 	for _, permission := range permissions {
 		if !permission.IsEnabled {
 			continue
 		}
-
-		// 首先尝试直接匹配
 		if permission.Route == route {
 			return true
 		}
-
-		// 然后尝试正则匹配
-		matched, err := regexp.MatchString(permission.Route, route)
-		if err == nil && matched {
+	}
+	// Pass 2: 正则匹配
+	for _, permission := range permissions {
+		if !permission.IsEnabled {
+			continue
+		}
+		if matched, err := regexp.MatchString(permission.Route, route); err == nil && matched {
 			return true
 		}
 	}
@@ -306,11 +327,17 @@ func (s *AuthTool) getUserPermissionsFromDB(ctx context.Context, userId string, 
 	var permissions []models.Permission
 	now := time.Now()
 
-	// 修正版SQL：使用正确的表名 (permissions, user_permissions, role_permissions, user_roles)
+	// 修正版SQL:使用正确的表名 (permissions, user_permissions, role_permissions, user_roles)
+	// Stage 6 fix #7:role_permissions 也加上 expired_at 时间过滤,与
+	// user_permissions 对齐(原本只 user_permissions 有 TTL 检查,角色权限永不过期)。
+	// 同时补上 permission 自身的 expired_at 过滤,确保过期权限不会被读出。
 	sql := `
 		SELECT p.*
 		FROM permissions p
-		WHERE p.tenant_id = $1 AND (
+		WHERE p.tenant_id = $1
+		  AND p.is_enabled = true
+		  AND (p.expired_at IS NULL OR p.expired_at > $4)
+		  AND (
 			-- 直接用户权限
 			EXISTS (
 				SELECT 1
@@ -331,6 +358,7 @@ func (s *AuthTool) getUserPermissionsFromDB(ctx context.Context, userId string, 
 				  AND ur.user_type = $3
 				  AND ur.tenant_id = $1
 				  AND rp.tenant_id = $1
+				  AND (rp.expired_at IS NULL OR rp.expired_at > $4)
 			)
 		)
 	`
@@ -352,6 +380,49 @@ func (s *AuthTool) getUserPermissionsFromDB(ctx context.Context, userId string, 
 	return permissions, nil
 }
 
+// clearAllUserPermissionCaches 重置每用户的权限快照(包括 fast-path 路由缓存)。
+// 用在权限规则本身被 CRUD 之后,因为不知道哪些用户可能持有受影响的规则。
+//
+// Stage 6 fix #3:之前 CreatePermission/Update/Delete 不做任何缓存清理,
+// 改了 permission 后已登录用户最长 4h(permissionCacheDuration)看不到。
+func (s *AuthTool) clearAllUserPermissionCaches() {
+	s.userPermissionsCache.Range(func(k, _ any) bool {
+		s.userPermissionsCache.Delete(k)
+		return true
+	})
+	s.userAllowedRoutesCache.Range(func(k, _ any) bool {
+		s.userAllowedRoutesCache.Delete(k)
+		return true
+	})
+	// Redis 那一层我们暂留 — 它仍按 permissionCacheDuration 过期。下次内存
+	// miss 走 Redis 的 4h-旧数据 → 立即又走 DB,只多 1 次 Redis 读,不破契约。
+}
+
+// clearUsersWithRole 清除已知缓存中持有指定角色的所有用户的权限缓存。
+//
+// Stage 6 fix #4:AssignPermissionToRole / RemovePermissionFromRole 之前
+// 只清自己的 rolePermissionsCache,但用户的 userPermissionsCache 是按
+// (tenant,type,user) 缓存的,不会自动失效。此处遍历缓存找到受影响的用户。
+//
+// 局限:只覆盖"角色已被缓存过"的用户。完美方案要查 user_roles 表找全部
+// 持有该角色的用户;此处保留为 future enhancement。
+func (s *AuthTool) clearUsersWithRole(roleID int64) {
+	s.userRolesCache.Range(func(k, v any) bool {
+		roles, ok := v.([]models.Role)
+		if !ok {
+			return true
+		}
+		for _, r := range roles {
+			if r.ID == roleID {
+				s.userPermissionsCache.Delete(k)
+				s.userAllowedRoutesCache.Delete(k)
+				return true
+			}
+		}
+		return true
+	})
+}
+
 // 以下是权限表的增删改查方法
 
 // CreatePermission 创建权限
@@ -360,6 +431,7 @@ func (s *AuthTool) CreatePermission(permission *models.Permission) error {
 	if result.Error != nil {
 		return result.Error
 	}
+	s.clearAllUserPermissionCaches()
 	return nil
 }
 
@@ -379,6 +451,7 @@ func (s *AuthTool) UpdatePermission(permission *models.Permission) error {
 	if result.Error != nil {
 		return result.Error
 	}
+	s.clearAllUserPermissionCaches()
 	return nil
 }
 
@@ -388,6 +461,7 @@ func (s *AuthTool) DeletePermission(id int64) error {
 	if result.Error != nil {
 		return result.Error
 	}
+	s.clearAllUserPermissionCaches()
 	return nil
 }
 
@@ -502,6 +576,8 @@ func (s *AuthTool) AssignPermissionToRole(roleID, permissionID int64) error {
 
 	// 清除缓存
 	s.rolePermissionsCache.Delete(roleID)
+	// Stage 6 fix #4:级联清持有该角色的用户的权限缓存
+	s.clearUsersWithRole(roleID)
 
 	return nil
 }
@@ -519,6 +595,8 @@ func (s *AuthTool) RemovePermissionFromRole(roleID, permissionID int64) error {
 
 	// 清除缓存
 	s.rolePermissionsCache.Delete(roleID)
+	// Stage 6 fix #4:级联清持有该角色的用户的权限缓存
+	s.clearUsersWithRole(roleID)
 
 	return nil
 }
@@ -666,9 +744,9 @@ func (s *AuthTool) AssignPermissionToUser(ctx context.Context, userId string, us
 		UpdatedAt:    time.Now(),
 	}
 
-	// 如果提供了过期时间，则设置
+	// 如果提供了过期时间，则设置(指针类型,nil 表示永久)
 	if expiredAt != nil {
-		userPermission.ExpiredAt = *expiredAt
+		userPermission.ExpiredAt = expiredAt
 	}
 
 	result := s.db.Chain().From(userPermission).Insert(userPermission)
