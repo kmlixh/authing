@@ -12,16 +12,16 @@ import (
 
 	"github.com/gofiber/fiber/v2"
 	"github.com/google/uuid"
-	"github.com/kmlixh/gom/v4"
-	"github.com/kmlixh/gom/v4/define"
-	_ "github.com/kmlixh/gom/v4/factory/postgres" // PostgreSQL驱动
 	"github.com/redis/go-redis/v9"
+	"gorm.io/driver/postgres"
+	"gorm.io/gorm"
+	gormlogger "gorm.io/gorm/logger"
 )
 
 // AuthTool 认证工具结构体
 type AuthTool struct {
 	redisClient             *redis.Client
-	db                      *gom.DB
+	db                      *gorm.DB
 	userRolesCache          sync.Map
 	userPermissionsCache    sync.Map
 	userAllowedRoutesCache  sync.Map // 新增：缓存用户已验证通过的具体路由
@@ -50,10 +50,35 @@ func NewAuthTool(config *Config) (*AuthTool, error) {
 		return nil, fmt.Errorf("redis connection failed: %v", err)
 	}
 
-	// 初始化数据库连接
-	db, err := gom.Open(config.DBDriver, config.DBDSN, config.DBOptions)
+	// 初始化数据库连接(gorm)。注:DBDriver 当前只接受 postgres;之前 gom 时
+	// 期那个字段是 driver name string,留下兼容。其它驱动需自行扩展。
+	gormCfg := &gorm.Config{
+		Logger: gormlogger.Default.LogMode(gormlogger.Warn),
+	}
+	if config.Debug {
+		gormCfg.Logger = gormlogger.Default.LogMode(gormlogger.Info)
+	}
+	db, err := gorm.Open(postgres.Open(config.DBDSN), gormCfg)
 	if err != nil {
 		return nil, fmt.Errorf("database connection failed: %v", err)
+	}
+	// 配置连接池(替代之前的 *define.DBOptions)
+	if sqlDB, err := db.DB(); err == nil {
+		maxOpen := config.MaxOpenConns
+		if maxOpen == 0 {
+			maxOpen = 10
+		}
+		maxIdle := config.MaxIdleConns
+		if maxIdle == 0 {
+			maxIdle = 5
+		}
+		lifeSec := config.ConnMaxLifetimeSec
+		if lifeSec == 0 {
+			lifeSec = 3600
+		}
+		sqlDB.SetMaxOpenConns(maxOpen)
+		sqlDB.SetMaxIdleConns(maxIdle)
+		sqlDB.SetConnMaxLifetime(time.Duration(lifeSec) * time.Second)
 	}
 
 	// 设置默认权限缓存时间
@@ -279,8 +304,7 @@ func (s *AuthTool) checkRouteWhitelist(route string) (bool, error) {
 	// DB 表(允许运营时动态加白,无需重启)
 	if s.db != nil {
 		var rows []models.RouteWhitelist
-		err := s.db.Chain().Table("route_whitelists").List(&rows).Into(&rows)
-		if err == nil {
+		if err := s.db.Table("route_whitelists").Find(&rows).Error; err == nil {
 			for _, r := range rows {
 				if !r.IsAllowed {
 					continue
@@ -363,17 +387,7 @@ func (s *AuthTool) getUserPermissionsFromDB(ctx context.Context, userId string, 
 		)
 	`
 
-	args := []interface{}{
-		tenantID, userId, userType, now,
-	}
-
-	result := s.db.Chain().RawQuery(sql, args...)
-	if result.Error != nil {
-		return nil, result.Error
-	}
-
-	err := result.Into(&permissions)
-	if err != nil {
+	if err := s.db.WithContext(ctx).Raw(sql, tenantID, userId, userType, now).Scan(&permissions).Error; err != nil {
 		return nil, err
 	}
 
@@ -427,9 +441,8 @@ func (s *AuthTool) clearUsersWithRole(roleID int64) {
 
 // CreatePermission 创建权限
 func (s *AuthTool) CreatePermission(permission *models.Permission) error {
-	result := s.db.Chain().From(permission).Insert(permission)
-	if result.Error != nil {
-		return result.Error
+	if err := s.db.Create(permission).Error; err != nil {
+		return err
 	}
 	s.clearAllUserPermissionCaches()
 	return nil
@@ -438,18 +451,16 @@ func (s *AuthTool) CreatePermission(permission *models.Permission) error {
 // GetPermissionByID 根据ID获取权限
 func (s *AuthTool) GetPermissionByID(id int64) (*models.Permission, error) {
 	var permission models.Permission
-	result := s.db.Chain().From(&permission).Where("id", define.OpEq, id).First(&permission)
-	if result.Error != nil {
-		return nil, result.Error
+	if err := s.db.Where("id = ?", id).First(&permission).Error; err != nil {
+		return nil, err
 	}
 	return &permission, nil
 }
 
 // UpdatePermission 更新权限
 func (s *AuthTool) UpdatePermission(permission *models.Permission) error {
-	result := s.db.Chain().From(permission).Where("id", define.OpEq, permission.ID).Update(permission)
-	if result.Error != nil {
-		return result.Error
+	if err := s.db.Save(permission).Error; err != nil {
+		return err
 	}
 	s.clearAllUserPermissionCaches()
 	return nil
@@ -457,9 +468,8 @@ func (s *AuthTool) UpdatePermission(permission *models.Permission) error {
 
 // DeletePermission 删除权限
 func (s *AuthTool) DeletePermission(id int64) error {
-	result := s.db.Chain().From(&models.Permission{}).Where("id", define.OpEq, id).Delete()
-	if result.Error != nil {
-		return result.Error
+	if err := s.db.Where("id = ?", id).Delete(&models.Permission{}).Error; err != nil {
+		return err
 	}
 	s.clearAllUserPermissionCaches()
 	return nil
@@ -468,18 +478,18 @@ func (s *AuthTool) DeletePermission(id int64) error {
 // ListPermissions 获取权限列表
 func (s *AuthTool) ListPermissions(page, pageSize int) ([]models.Permission, int64, error) {
 	var permissions []models.Permission
-	chain := s.db.Chain().From(&models.Permission{})
 
 	// 获取总数
-	total, err := chain.Count()
-	if err != nil {
+	var total int64
+	if err := s.db.Model(&models.Permission{}).Count(&total).Error; err != nil {
 		return nil, 0, err
 	}
 
 	// 分页查询
-	result := chain.Page(page, pageSize).List(&permissions)
-	if result.Error != nil {
-		return nil, 0, result.Error
+	if err := s.db.Model(&models.Permission{}).
+		Limit(pageSize).Offset((page - 1) * pageSize).
+		Find(&permissions).Error; err != nil {
+		return nil, 0, err
 	}
 
 	return permissions, total, nil
@@ -489,56 +499,41 @@ func (s *AuthTool) ListPermissions(page, pageSize int) ([]models.Permission, int
 
 // CreateRole 创建角色
 func (s *AuthTool) CreateRole(role *models.Role) error {
-	result := s.db.Chain().From(role).Insert(role)
-	if result.Error != nil {
-		return result.Error
-	}
-	return nil
+	return s.db.Create(role).Error
 }
 
 // GetRoleByID 根据ID获取角色
 func (s *AuthTool) GetRoleByID(id int64) (*models.Role, error) {
 	var role models.Role
-	result := s.db.Chain().From(&role).Where("id", define.OpEq, id).First(&role)
-	if result.Error != nil {
-		return nil, result.Error
+	if err := s.db.Where("id = ?", id).First(&role).Error; err != nil {
+		return nil, err
 	}
 	return &role, nil
 }
 
 // UpdateRole 更新角色
 func (s *AuthTool) UpdateRole(role *models.Role) error {
-	result := s.db.Chain().From(role).Where("id", define.OpEq, role.ID).Update(role)
-	if result.Error != nil {
-		return result.Error
-	}
-	return nil
+	return s.db.Save(role).Error
 }
 
 // DeleteRole 删除角色
 func (s *AuthTool) DeleteRole(id int64) error {
-	result := s.db.Chain().From(&models.Role{}).Where("id", define.OpEq, id).Delete()
-	if result.Error != nil {
-		return result.Error
-	}
-	return nil
+	return s.db.Where("id = ?", id).Delete(&models.Role{}).Error
 }
 
 // ListRoles 获取角色列表
 func (s *AuthTool) ListRoles(page, pageSize int) ([]models.Role, int64, error) {
 	var roles []models.Role
-	chain := s.db.Chain().From(&models.Role{})
 
-	// 获取总数
-	total, err := chain.Count()
-	if err != nil {
+	var total int64
+	if err := s.db.Model(&models.Role{}).Count(&total).Error; err != nil {
 		return nil, 0, err
 	}
 
-	// 分页查询
-	result := chain.Page(page, pageSize).List(&roles)
-	if result.Error != nil {
-		return nil, 0, result.Error
+	if err := s.db.Model(&models.Role{}).
+		Limit(pageSize).Offset((page - 1) * pageSize).
+		Find(&roles).Error; err != nil {
+		return nil, 0, err
 	}
 
 	return roles, total, nil
@@ -569,9 +564,8 @@ func (s *AuthTool) AssignPermissionToRole(roleID, permissionID int64) error {
 		UpdatedAt:      time.Now(),
 	}
 
-	result := s.db.Chain().From(rolePermission).Insert(rolePermission)
-	if result.Error != nil {
-		return result.Error
+	if err := s.db.Create(rolePermission).Error; err != nil {
+		return err
 	}
 
 	// 清除缓存
@@ -584,13 +578,9 @@ func (s *AuthTool) AssignPermissionToRole(roleID, permissionID int64) error {
 
 // RemovePermissionFromRole 从角色中移除权限
 func (s *AuthTool) RemovePermissionFromRole(roleID, permissionID int64) error {
-	result := s.db.Chain().From(&models.RolePermission{}).
-		Where("role_id", define.OpEq, roleID).
-		And("permission_id", define.OpEq, permissionID).
-		Delete()
-
-	if result.Error != nil {
-		return result.Error
+	if err := s.db.Where("role_id = ? AND permission_id = ?", roleID, permissionID).
+		Delete(&models.RolePermission{}).Error; err != nil {
+		return err
 	}
 
 	// 清除缓存
@@ -610,15 +600,13 @@ func (s *AuthTool) GetRolePermissions(ctx context.Context, roleID int64) ([]mode
 
 	// 从数据库获取
 	var permissions []models.Permission
-	result := s.db.Chain().
+	if err := s.db.WithContext(ctx).
 		Table("role_permissions rp").
-		Fields("p.*").
-		Join("JOIN permissions p ON rp.permission_id = p.id").
-		Where("rp.role_id", define.OpEq, roleID).
-		List(&permissions)
-
-	if result.Error != nil {
-		return nil, result.Error
+		Select("p.*").
+		Joins("JOIN permissions p ON rp.permission_id = p.id").
+		Where("rp.role_id = ?", roleID).
+		Find(&permissions).Error; err != nil {
+		return nil, err
 	}
 
 	// 更新缓存
@@ -648,9 +636,8 @@ func (s *AuthTool) AssignRoleToUser(ctx context.Context, userId string, userType
 		UpdatedAt: time.Now(),
 	}
 
-	result := s.db.Chain().From(userRole).Insert(userRole)
-	if result.Error != nil {
-		return result.Error
+	if err := s.db.WithContext(ctx).Create(userRole).Error; err != nil {
+		return err
 	}
 
 	// 清除缓存
@@ -664,15 +651,11 @@ func (s *AuthTool) AssignRoleToUser(ctx context.Context, userId string, userType
 
 // RemoveRoleFromUser 从用户中移除角色
 func (s *AuthTool) RemoveRoleFromUser(ctx context.Context, userID string, userType string, tenantID string, roleID int64) error {
-	result := s.db.Chain().From(&models.UserRole{}).
-		Where("user_id", define.OpEq, userID).
-		And("user_type", define.OpEq, userType).
-		And("role_id", define.OpEq, roleID).
-		And("tenant_id", define.OpEq, tenantID).
-		Delete()
-
-	if result.Error != nil {
-		return result.Error
+	if err := s.db.WithContext(ctx).
+		Where("user_id = ? AND user_type = ? AND role_id = ? AND tenant_id = ?",
+			userID, userType, roleID, tenantID).
+		Delete(&models.UserRole{}).Error; err != nil {
+		return err
 	}
 
 	// 清除缓存
@@ -699,17 +682,8 @@ func (s *AuthTool) GetUserRoles(ctx context.Context, userId string, userType str
 		WHERE ur.user_id = $1 AND ur.user_type = $2 AND ur.tenant_id = $3 AND r.tenant_id = $4
 	`
 
-	args := []interface{}{userId, userType, tenantID, tenantID}
-
 	var roles []models.Role
-	result := s.db.Chain().RawQuery(sql, args...)
-
-	if result.Error != nil {
-		return nil, result.Error
-	}
-
-	err := result.Into(&roles)
-	if err != nil {
+	if err := s.db.WithContext(ctx).Raw(sql, userId, userType, tenantID, tenantID).Scan(&roles).Error; err != nil {
 		return nil, err
 	}
 
@@ -749,9 +723,8 @@ func (s *AuthTool) AssignPermissionToUser(ctx context.Context, userId string, us
 		userPermission.ExpiredAt = expiredAt
 	}
 
-	result := s.db.Chain().From(userPermission).Insert(userPermission)
-	if result.Error != nil {
-		return result.Error
+	if err := s.db.WithContext(ctx).Create(userPermission).Error; err != nil {
+		return err
 	}
 
 	// 清除缓存
@@ -764,15 +737,11 @@ func (s *AuthTool) AssignPermissionToUser(ctx context.Context, userId string, us
 
 // RemovePermissionFromUser 从用户中移除直接权限
 func (s *AuthTool) RemovePermissionFromUser(ctx context.Context, userId string, userType string, tenantID string, permissionID int64) error {
-	result := s.db.Chain().From(&models.UserPermission{}).
-		Where("user_id", define.OpEq, userId).
-		And("user_type", define.OpEq, userType).
-		And("permission_id", define.OpEq, permissionID).
-		And("tenant_id", define.OpEq, tenantID).
-		Delete()
-
-	if result.Error != nil {
-		return result.Error
+	if err := s.db.WithContext(ctx).
+		Where("user_id = ? AND user_type = ? AND permission_id = ? AND tenant_id = ?",
+			userId, userType, permissionID, tenantID).
+		Delete(&models.UserPermission{}).Error; err != nil {
+		return err
 	}
 
 	// 清除缓存
@@ -788,16 +757,14 @@ func (s *AuthTool) GetUserDirectPermissions(ctx context.Context, userId string, 
 	var permissions []models.Permission
 	now := time.Now()
 
-	result := s.db.Chain().
+	if err := s.db.WithContext(ctx).
 		Table("permissions").
-		Join("user_permissions ON user_permissions.permission_id = permissions.id").
-		Where("user_permissions.user_id", define.OpEq, userId).
-		And("user_permissions.user_type", define.OpEq, userType).
-		WhereRaw("user_permissions.expired_at IS NULL OR user_permissions.expired_at > ?", now).
-		List(&permissions)
-
-	if result.Error != nil {
-		return nil, result.Error
+		Joins("JOIN user_permissions ON user_permissions.permission_id = permissions.id").
+		Where("user_permissions.user_id = ?", userId).
+		Where("user_permissions.user_type = ?", userType).
+		Where("user_permissions.expired_at IS NULL OR user_permissions.expired_at > ?", now).
+		Find(&permissions).Error; err != nil {
+		return nil, err
 	}
 
 	return permissions, nil
@@ -815,56 +782,39 @@ func (s *AuthTool) AddRouteWhitelist(ctx context.Context, route string, isAllowe
 		UpdatedAt: time.Now(),
 	}
 
-	result := s.db.Chain().From(whitelist).Insert(whitelist)
-	if result.Error != nil {
-		return result.Error
-	}
-
-	return nil
+	return s.db.WithContext(ctx).Create(whitelist).Error
 }
 
 // UpdateRouteWhitelist 更新路由白名单
 func (s *AuthTool) UpdateRouteWhitelist(ctx context.Context, id int64, isAllowed bool, ipList string) error {
-	whitelist := &models.RouteWhitelist{
-		ID:        id,
-		IsAllowed: isAllowed,
-		IPList:    ipList,
-		UpdatedAt: time.Now(),
-	}
-
-	result := s.db.Chain().From(whitelist).Where("id", define.OpEq, id).Update(whitelist)
-	if result.Error != nil {
-		return result.Error
-	}
-
-	return nil
+	// 只更新 is_allowed / ip_list / updated_at 三列,避免清空其它字段
+	return s.db.WithContext(ctx).Model(&models.RouteWhitelist{}).
+		Where("id = ?", id).
+		Updates(map[string]interface{}{
+			"is_allowed": isAllowed,
+			"ip_list":    ipList,
+			"updated_at": time.Now(),
+		}).Error
 }
 
 // DeleteRouteWhitelist 删除路由白名单
 func (s *AuthTool) DeleteRouteWhitelist(id int64) error {
-	result := s.db.Chain().From(&models.RouteWhitelist{}).Where("id", define.OpEq, id).Delete()
-	if result.Error != nil {
-		return result.Error
-	}
-
-	return nil
+	return s.db.Where("id = ?", id).Delete(&models.RouteWhitelist{}).Error
 }
 
 // ListRouteWhitelists 获取路由白名单列表
 func (s *AuthTool) ListRouteWhitelists(page, pageSize int) ([]models.RouteWhitelist, int64, error) {
 	var whitelists []models.RouteWhitelist
-	chain := s.db.Chain().From(&models.RouteWhitelist{})
 
-	// 获取总数
-	total, err := chain.Count()
-	if err != nil {
+	var total int64
+	if err := s.db.Model(&models.RouteWhitelist{}).Count(&total).Error; err != nil {
 		return nil, 0, err
 	}
 
-	// 分页查询
-	result := chain.Page(page, pageSize).List(&whitelists)
-	if result.Error != nil {
-		return nil, 0, result.Error
+	if err := s.db.Model(&models.RouteWhitelist{}).
+		Limit(pageSize).Offset((page - 1) * pageSize).
+		Find(&whitelists).Error; err != nil {
+		return nil, 0, err
 	}
 
 	return whitelists, total, nil
@@ -956,25 +906,22 @@ func (s *AuthTool) GetPermissions(ctx context.Context, page int, pageSize int, t
 	var permissions []models.Permission
 
 	// 构建查询条件
-	chain := s.db.Chain().SetContext(ctx).Table("permissions").Where("tenant_id", define.OpEq, tenantID)
+	q := s.db.WithContext(ctx).Table("permissions").Where("tenant_id = ?", tenantID)
 
 	// 添加过滤条件
-	if filter != nil {
-		for k, v := range filter {
-			chain.And(k, define.OpEq, v)
-		}
+	for k, v := range filter {
+		q = q.Where(fmt.Sprintf("%s = ?", k), v)
 	}
 
 	// 获取总数
-	total, err := chain.Count()
-	if err != nil {
+	var total int64
+	if err := q.Count(&total).Error; err != nil {
 		return nil, 0, fmt.Errorf("failed to count permissions: %v", err)
 	}
 
 	// 获取分页数据
-	result := chain.Page(page, pageSize).List(&permissions)
-	if result.Error != nil {
-		return nil, 0, fmt.Errorf("failed to get permissions: %v", result.Error)
+	if err := q.Limit(pageSize).Offset((page - 1) * pageSize).Find(&permissions).Error; err != nil {
+		return nil, 0, fmt.Errorf("failed to get permissions: %v", err)
 	}
 
 	return permissions, total, nil
@@ -984,26 +931,19 @@ func (s *AuthTool) GetPermissions(ctx context.Context, page int, pageSize int, t
 func (s *AuthTool) GetRoles(ctx context.Context, page int, pageSize int, tenantID string, filter map[string]interface{}) ([]models.Role, int64, error) {
 	var roles []models.Role
 
-	// 构建查询条件
-	chain := s.db.Chain().SetContext(ctx).Table("roles").Where("tenant_id", define.OpEq, tenantID)
+	q := s.db.WithContext(ctx).Table("roles").Where("tenant_id = ?", tenantID)
 
-	// 添加过滤条件
-	if filter != nil {
-		for k, v := range filter {
-			chain.And(k, define.OpEq, v)
-		}
+	for k, v := range filter {
+		q = q.Where(fmt.Sprintf("%s = ?", k), v)
 	}
 
-	// 获取总数
-	total, err := chain.Count()
-	if err != nil {
+	var total int64
+	if err := q.Count(&total).Error; err != nil {
 		return nil, 0, fmt.Errorf("failed to count roles: %v", err)
 	}
 
-	// 获取分页数据
-	result := chain.Page(page, pageSize).List(&roles)
-	if result.Error != nil {
-		return nil, 0, fmt.Errorf("failed to get roles: %v", result.Error)
+	if err := q.Limit(pageSize).Offset((page - 1) * pageSize).Find(&roles).Error; err != nil {
+		return nil, 0, fmt.Errorf("failed to get roles: %v", err)
 	}
 
 	return roles, total, nil
@@ -1012,29 +952,24 @@ func (s *AuthTool) GetRoles(ctx context.Context, page int, pageSize int, tenantI
 // CreateTenant 创建新租户
 func (s *AuthTool) CreateTenant(ctx context.Context, tenantID, name, description string) error {
 	tenant := models.NewTenant(tenantID, name, description)
-	result := s.db.Chain().Insert(tenant)
-	return result.Error
+	return s.db.WithContext(ctx).Create(tenant).Error
 }
 
 // GetTenant 获取租户信息
 func (s *AuthTool) GetTenant(ctx context.Context, tenantID string) (*models.Tenant, error) {
 	var tenant models.Tenant
-	result := s.db.Chain().Table(tenant.TableName()).
-		Where("tenant_id", define.OpEq, tenantID).
-		First(&tenant)
-
-	if result.Error != nil {
-		return nil, result.Error
+	if err := s.db.WithContext(ctx).
+		Where("tenant_id = ?", tenantID).
+		First(&tenant).Error; err != nil {
+		return nil, err
 	}
-
 	return &tenant, nil
 }
 
 // UpdateTenant 更新租户信息
 func (s *AuthTool) UpdateTenant(ctx context.Context, tenant *models.Tenant) error {
 	tenant.UpdatedAt = time.Now()
-	result := s.db.Chain().Update(tenant)
-	return result.Error
+	return s.db.WithContext(ctx).Save(tenant).Error
 }
 
 // DeleteTenant 删除租户
@@ -1043,36 +978,30 @@ func (s *AuthTool) DeleteTenant(ctx context.Context, tenantID string) error {
 	if err != nil {
 		return err
 	}
-
-	result := s.db.Chain().Delete(tenant)
-	return result.Error
+	return s.db.WithContext(ctx).Delete(tenant).Error
 }
 
 // GetTenants 获取租户列表
 func (s *AuthTool) GetTenants(ctx context.Context, page, pageSize int, condition map[string]interface{}) ([]models.Tenant, int64, error) {
 	var tenants []models.Tenant
-	var tenant models.Tenant
 
 	// 构建查询
-	chain := s.db.Chain().Table(tenant.TableName())
+	q := s.db.WithContext(ctx).Model(&models.Tenant{})
 
 	// 添加查询条件
-	if condition != nil {
-		for k, v := range condition {
-			chain = chain.Where(k, define.OpEq, v)
-		}
+	for k, v := range condition {
+		q = q.Where(fmt.Sprintf("%s = ?", k), v)
 	}
 
 	// 获取总数
-	total, err := chain.Count()
-	if err != nil {
+	var total int64
+	if err := q.Count(&total).Error; err != nil {
 		return nil, 0, err
 	}
 
 	// 分页查询
-	result := chain.Offset((page - 1) * pageSize).Limit(pageSize).List(&tenants)
-	if result.Error != nil {
-		return nil, 0, result.Error
+	if err := q.Offset((page - 1) * pageSize).Limit(pageSize).Find(&tenants).Error; err != nil {
+		return nil, 0, err
 	}
 
 	return tenants, total, nil

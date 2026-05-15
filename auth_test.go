@@ -5,7 +5,6 @@ import (
 	"testing"
 	"time"
 
-	_ "github.com/kmlixh/gom/v4/factory/postgres" // 导入PostgreSQL驱动
 	"github.com/stretchr/testify/assert"
 )
 
