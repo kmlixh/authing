@@ -29,6 +29,10 @@ type AuthTool struct {
 	permissionCacheDuration time.Duration
 	config                  *Config
 	mu                      sync.RWMutex
+
+	// jwks 是 OAuth IdP 的公钥缓存。Config.OAuthIssuer 为空时此字段为 nil,
+	// AuthMiddleware 只走 Redis 路径(向后兼容 anylogin opaque token)。
+	jwks *JWKSCache
 }
 
 // NewAuthTool 创建新的认证工具实例
@@ -58,17 +62,38 @@ func NewAuthTool(config *Config) (*AuthTool, error) {
 		permissionCacheDuration = 4 * time.Hour
 	}
 
-	return &AuthTool{
+	tool := &AuthTool{
 		redisClient:             redisClient,
 		db:                      db,
 		permissionCacheDuration: permissionCacheDuration,
 		config:                  config,
-	}, nil
+	}
+
+	// 如果配置了 OAuth Issuer,初始化 JWKS 缓存。第一次 Get(kid) 会自动
+	// 拉取 discovery + JWKS;这里不强制预热,避免 NewAuthTool 在 IdP 未就绪
+	// 时阻塞启动。
+	if config.OAuthIssuer != "" {
+		tool.jwks = NewJWKSCache(config.OAuthIssuer, config.JWKSRefreshInterval, nil)
+	}
+	return tool, nil
 }
 
-// ValidateToken 验证用户token
+// ValidateToken 验证用户 token,按形态自动分发:
+//
+//   - 三段式 base64url(JWT 紧凑序列化)→ 走 ES256 + JWKS 校验,
+//     从 claims 取 sub/tenant_id/user_type。前提是 Config.OAuthIssuer 已配置。
+//   - 其它形态(opaque token)→ 查 Redis 的 user_id_<t> / user_type_<t> /
+//     tenant_id_<t>,这是 anylogin 老的 SetToken 流程。
+//
+// 这个 dispatch 让消费方应用引入 authing 后,**无论用户拿的是 anylogin
+// directLogin 颁发的 opaque token,还是 OAuth /token 颁发的 JWT,都能
+// 直接通过同一个 AuthMiddleware**,真正"一站式"。
 func (s *AuthTool) ValidateToken(ctx context.Context, token string) (string, string, string, error) {
-	// 从Redis获取用户ID、类型和租户ID
+	if IsJWT(token) && s.jwks != nil {
+		return s.validateJWT(ctx, token)
+	}
+
+	// Opaque token 路径(向后兼容)
 	userIdKey := fmt.Sprintf("user_id_%s", token)
 	userId, err := s.redisClient.Get(ctx, userIdKey).Result()
 	if err != nil {

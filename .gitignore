@@ -1,7 +1,38 @@
-.
+# Go binaries
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+bin/
+dist/
+
+# Test artefacts
+*.test
+*.out
+coverage.html
+
+# Workspace + deps
+vendor/
+go.work
+
+# IDE
 .idea
 .vscode
+*.swp
+*.swo
+*~
+
+# Env files
 .env
 .env.local
 .env.development
 .env.production
+
+# Logs
+*.log
+logs/
+
+# OS
+.DS_Store
+Thumbs.db

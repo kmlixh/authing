@@ -18,6 +18,15 @@ type Config struct {
 	// 白名单配置
 	WhitelistRoutes []string // 白名单路由列表
 	BlacklistRoutes []string // 黑名单路由列表
+
+	// OAuthIssuer 是 IdP 的发行者 URL,例如 https://auth.janyee.com。
+	// 设置后,authing 会通过 <issuer>/.well-known/openid-configuration 自动发现
+	// jwks_uri 并缓存公钥,用于校验 OAuth 颁发的 ES256 access token。
+	// 留空则只支持原有的 anylogin opaque token (Redis 查询模式)。
+	OAuthIssuer string
+	// JWKSRefreshInterval 控制 JWKS 缓存的最大寿命;默认 1h。kid 不在缓存里时
+	// 会立即刷新一次(带最短 30s 间隔的 throttle,避免对端被打爆)。
+	JWKSRefreshInterval time.Duration
 }
 
 // UpdateConfig 更新配置
