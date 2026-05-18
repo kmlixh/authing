@@ -37,48 +37,67 @@ type AuthTool struct {
 
 // NewAuthTool 创建新的认证工具实例
 func NewAuthTool(config *Config) (*AuthTool, error) {
-	// 初始化Redis客户端
-	redisClient := redis.NewClient(&redis.Options{
-		Addr:     config.RedisAddr,
-		Password: config.RedisPassword,
-		DB:       config.RedisDB,
-	})
+	// 三种使用形态,Redis/DB 按需初始化:
+	//
+	//   1. 老的 IdP 内部消费(adminBackend/userLogin):RedisAddr + DBDSN 都配
+	//      → opaque token + JWT 双路径都开,AuthMiddleware 能查权限
+	//
+	//   2. 第三方 Go backend 拿 OAuth JWT 做鉴权:只配 OAuthIssuer
+	//      → Redis/DB 跳过初始化,只走 JWT 路径,无任何外部依赖
+	//      → 推荐用 NewJWTValidator(issuer) 这个 helper,更直白
+	//
+	//   3. 中间形态:配 Redis 不配 DB
+	//      → 既能验 opaque(查 Redis)又能验 JWT,但不查权限
+	//      → 适合不做 RBAC 的服务
 
-	// 测试Redis连接
-	ctx := context.Background()
-	if err := redisClient.Ping(ctx).Err(); err != nil {
-		return nil, fmt.Errorf("redis connection failed: %v", err)
+	tool := &AuthTool{
+		config: config,
 	}
 
-	// 初始化数据库连接(gorm)。注:DBDriver 当前只接受 postgres;之前 gom 时
-	// 期那个字段是 driver name string,留下兼容。其它驱动需自行扩展。
-	gormCfg := &gorm.Config{
-		Logger: gormlogger.Default.LogMode(gormlogger.Warn),
-	}
-	if config.Debug {
-		gormCfg.Logger = gormlogger.Default.LogMode(gormlogger.Info)
-	}
-	db, err := gorm.Open(postgres.Open(config.DBDSN), gormCfg)
-	if err != nil {
-		return nil, fmt.Errorf("database connection failed: %v", err)
-	}
-	// 配置连接池(替代之前的 *define.DBOptions)
-	if sqlDB, err := db.DB(); err == nil {
-		maxOpen := config.MaxOpenConns
-		if maxOpen == 0 {
-			maxOpen = 10
+	// === Redis(可选)— 配了才初始化,opaque token 路径需要 ===
+	if config.RedisAddr != "" {
+		redisClient := redis.NewClient(&redis.Options{
+			Addr:     config.RedisAddr,
+			Password: config.RedisPassword,
+			DB:       config.RedisDB,
+		})
+		ctx := context.Background()
+		if err := redisClient.Ping(ctx).Err(); err != nil {
+			return nil, fmt.Errorf("redis connection failed: %v", err)
 		}
-		maxIdle := config.MaxIdleConns
-		if maxIdle == 0 {
-			maxIdle = 5
+		tool.redisClient = redisClient
+	}
+
+	// === DB(可选)— 配了才初始化,permission check 路径需要 ===
+	if config.DBDSN != "" {
+		gormCfg := &gorm.Config{
+			Logger: gormlogger.Default.LogMode(gormlogger.Warn),
 		}
-		lifeSec := config.ConnMaxLifetimeSec
-		if lifeSec == 0 {
-			lifeSec = 3600
+		if config.Debug {
+			gormCfg.Logger = gormlogger.Default.LogMode(gormlogger.Info)
 		}
-		sqlDB.SetMaxOpenConns(maxOpen)
-		sqlDB.SetMaxIdleConns(maxIdle)
-		sqlDB.SetConnMaxLifetime(time.Duration(lifeSec) * time.Second)
+		db, err := gorm.Open(postgres.Open(config.DBDSN), gormCfg)
+		if err != nil {
+			return nil, fmt.Errorf("database connection failed: %v", err)
+		}
+		if sqlDB, err := db.DB(); err == nil {
+			maxOpen := config.MaxOpenConns
+			if maxOpen == 0 {
+				maxOpen = 10
+			}
+			maxIdle := config.MaxIdleConns
+			if maxIdle == 0 {
+				maxIdle = 5
+			}
+			lifeSec := config.ConnMaxLifetimeSec
+			if lifeSec == 0 {
+				lifeSec = 3600
+			}
+			sqlDB.SetMaxOpenConns(maxOpen)
+			sqlDB.SetMaxIdleConns(maxIdle)
+			sqlDB.SetConnMaxLifetime(time.Duration(lifeSec) * time.Second)
+		}
+		tool.db = db
 	}
 
 	// 设置默认权限缓存时间
@@ -86,21 +105,37 @@ func NewAuthTool(config *Config) (*AuthTool, error) {
 	if permissionCacheDuration == 0 {
 		permissionCacheDuration = 4 * time.Hour
 	}
+	tool.permissionCacheDuration = permissionCacheDuration
 
-	tool := &AuthTool{
-		redisClient:             redisClient,
-		db:                      db,
-		permissionCacheDuration: permissionCacheDuration,
-		config:                  config,
-	}
-
-	// 如果配置了 OAuth Issuer,初始化 JWKS 缓存。第一次 Get(kid) 会自动
-	// 拉取 discovery + JWKS;这里不强制预热,避免 NewAuthTool 在 IdP 未就绪
-	// 时阻塞启动。
+	// === JWKS(OAuth Issuer 配了就开)===
+	// 不配 OAuthIssuer 且不配 Redis 等于"啥也验不了",直接报错
 	if config.OAuthIssuer != "" {
 		tool.jwks = NewJWKSCache(config.OAuthIssuer, config.JWKSRefreshInterval, nil)
 	}
+	if tool.redisClient == nil && tool.jwks == nil {
+		return nil, fmt.Errorf("at least one of RedisAddr or OAuthIssuer must be configured")
+	}
+
 	return tool, nil
+}
+
+// NewJWTValidator 第三方 Go backend 最简用法 — 只想验 userLogin 颁的
+// OAuth ES256 JWT,无 Redis、无 DB、无 permission check。
+//
+// 用法:
+//
+//	tool, err := authing.NewJWTValidator("https://auth.janyee.com")
+//	if err != nil { log.Fatal(err) }
+//
+//	// 在你的 fiber middleware 里:
+//	userID, userType, tenantID, err := tool.ValidateToken(ctx, bearerToken)
+//
+// 内部就是 NewAuthTool 跑一遍只配 OAuthIssuer 的 Config,封装一下让 API 更直白。
+func NewJWTValidator(issuer string) (*AuthTool, error) {
+	if issuer == "" {
+		return nil, fmt.Errorf("issuer required (e.g. \"https://auth.janyee.com\")")
+	}
+	return NewAuthTool(&Config{OAuthIssuer: issuer})
 }
 
 // ValidateToken 验证用户 token,按形态自动分发:
@@ -118,7 +153,15 @@ func (s *AuthTool) ValidateToken(ctx context.Context, token string) (string, str
 		return s.validateJWT(ctx, token)
 	}
 
-	// Opaque token 路径(向后兼容)
+	// Opaque token 路径(向后兼容)— 仅当 Redis 配了才走
+	// 第三方用 NewJWTValidator 的场景下 redisClient 是 nil,直接报错
+	if s.redisClient == nil {
+		if IsJWT(token) {
+			return "", "", "", fmt.Errorf("invalid token: JWT validation failed (jwks not configured? check OAuthIssuer)")
+		}
+		return "", "", "", fmt.Errorf("invalid token: opaque token requires Redis (not configured in this AuthTool instance)")
+	}
+
 	userIdKey := fmt.Sprintf("user_id_%s", token)
 	userId, err := s.redisClient.Get(ctx, userIdKey).Result()
 	if err != nil {
@@ -221,13 +264,79 @@ func (s *AuthTool) CacheUserPermissions(ctx context.Context, userId string, user
 	return s.redisClient.Set(ctx, redisKey, permissionsJSON, s.permissionCacheDuration).Err()
 }
 
-// AuthMiddleware 认证中间件
-func (s *AuthTool) AuthMiddleware() fiber.Handler {
+// ========================================================================
+// 中间件分层 — 身份(authentication)跟权限(authorization)解耦
+// ========================================================================
+//
+// 三个 middleware,按职责分:
+//
+//   IdentityMiddleware()    身份层 — 验 token,把 (user_id, user_type, tenant_id)
+//                                      塞进 c.Locals。不查权限,不知道路由意义。
+//                                      第三方服务只想拿到"这是谁"用这个就够。
+//
+//   PermissionMiddleware()  权限层 — 假设 Locals 已经有 identity(必须先过
+//                                      IdentityMiddleware 或调用方自己塞),
+//                                      调 CheckPermission 决定能否进路由。
+//                                      白名单 / 黑名单逻辑也在这层。
+//
+//   AuthMiddleware()        全套(向后兼容)— = IdentityMiddleware + PermissionMiddleware,
+//                                      跟之前行为完全一致,老消费方不动。
+//
+// 第三方 Go 服务可以挑组合:
+//   - 只要身份认证:   app.Use(auth.IdentityMiddleware())
+//   - 身份 + 权限:    app.Use(auth.AuthMiddleware())                // 或拆两个
+//   - 自带身份层、只要权限: app.Use(myIdentity, auth.PermissionMiddleware())
+
+// IdentityMiddleware 只验 token,不查权限。
+//
+// 流程:
+//   1. 从 `Token` 头取 token
+//   2. ValidateToken → 拿 (user_id, user_type, tenant_id)
+//        - JWT (ES256) → JWKS 验签 + 解 claims(无 Redis,无 DB)
+//        - opaque (UUID-like) → Redis lookup(老 anylogin/admin 路径)
+//   3. 写入 c.Locals,c.Next()
+//
+// 401 触发条件:Token 头缺失 / token 无效 / Redis 没找到 / JWT 验签失败。
+// 不会返 403(权限拒绝是 PermissionMiddleware 的事)。
+func (s *AuthTool) IdentityMiddleware() fiber.Handler {
 	return func(c *fiber.Ctx) error {
-		// 获取请求路径
+		token := c.Get("Token")
+		if token == "" {
+			return c.Status(fiber.StatusUnauthorized).JSON(fiber.Map{
+				"message": "Missing authorization token",
+			})
+		}
+
+		userId, userType, tenantId, err := s.ValidateToken(c.Context(), token)
+		if err != nil {
+			return c.Status(fiber.StatusUnauthorized).JSON(fiber.Map{
+				"message": "Invalid token",
+			})
+		}
+
+		c.Locals("user_id", userId)
+		c.Locals("user_type", userType)
+		c.Locals("tenant_id", tenantId)
+
+		return c.Next()
+	}
+}
+
+// PermissionMiddleware 只查权限,假设 Locals 已经有 identity。
+//
+// 流程:
+//   1. checkRouteWhitelist(白/黑名单)→ 白名单直接 Next
+//   2. 从 Locals 取 user_id / user_type / tenant_id;没有就 401
+//      (说明没过 IdentityMiddleware,这是个 mis-config)
+//   3. CheckPermission → 不通过 403
+//
+// 调用方负责保证 Locals 已经写好;通常的用法是跟 IdentityMiddleware 串联:
+//   app.Use(auth.IdentityMiddleware(), auth.PermissionMiddleware())
+// 或者直接用 AuthMiddleware(下面)一把梭。
+func (s *AuthTool) PermissionMiddleware() fiber.Handler {
+	return func(c *fiber.Ctx) error {
 		route := c.Path()
 
-		// 检查路由白名单
 		whitelisted, err := s.checkRouteWhitelist(route)
 		if err != nil {
 			return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
@@ -238,23 +347,16 @@ func (s *AuthTool) AuthMiddleware() fiber.Handler {
 			return c.Next()
 		}
 
-		// 获取token
-		token := c.Get("Token")
-		if token == "" {
+		userId, _ := c.Locals("user_id").(string)
+		userType, _ := c.Locals("user_type").(string)
+		tenantId, _ := c.Locals("tenant_id").(string)
+		if userId == "" {
+			// Identity 没设 — 调用方忘了在前面挂 IdentityMiddleware
 			return c.Status(fiber.StatusUnauthorized).JSON(fiber.Map{
-				"message": "Missing authorization token",
+				"message": "Missing identity in context (forgot IdentityMiddleware?)",
 			})
 		}
 
-		// 验证token
-		userId, userType, tenantId, err := s.ValidateToken(c.Context(), token)
-		if err != nil {
-			return c.Status(fiber.StatusUnauthorized).JSON(fiber.Map{
-				"message": "Invalid token",
-			})
-		}
-
-		// 检查权限
 		hasPermission, err := s.CheckPermission(c.Context(), userId, userType, tenantId, route)
 		if err != nil {
 			return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
@@ -267,10 +369,62 @@ func (s *AuthTool) AuthMiddleware() fiber.Handler {
 			})
 		}
 
-		// 将用户信息存储到上下文中
+		return c.Next()
+	}
+}
+
+// AuthMiddleware 全套认证中间件 = Identity + Permission(向后兼容老消费方)。
+//
+// 旧调用 `app.Use(auth.AuthMiddleware())` 行为不变。
+// 想分层用,改成 `app.Use(auth.IdentityMiddleware(), auth.PermissionMiddleware())`,
+// 中间可以插自己的中间件(限流、审计、日志等)。
+//
+// 实现直接 inline Identity + Permission 的步骤(不通过 fiber Next 链调用,
+// 那样需要把后者当 Next handler 传,代码更绕)。
+func (s *AuthTool) AuthMiddleware() fiber.Handler {
+	return func(c *fiber.Ctx) error {
+		route := c.Path()
+
+		// 1. 白名单 — 早期 short-circuit,免取 token
+		whitelisted, err := s.checkRouteWhitelist(route)
+		if err != nil {
+			return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
+				"message": "Error checking route whitelist",
+			})
+		}
+		if whitelisted {
+			return c.Next()
+		}
+
+		// 2. Identity — 验 token + 写 Locals
+		token := c.Get("Token")
+		if token == "" {
+			return c.Status(fiber.StatusUnauthorized).JSON(fiber.Map{
+				"message": "Missing authorization token",
+			})
+		}
+		userId, userType, tenantId, err := s.ValidateToken(c.Context(), token)
+		if err != nil {
+			return c.Status(fiber.StatusUnauthorized).JSON(fiber.Map{
+				"message": "Invalid token",
+			})
+		}
 		c.Locals("user_id", userId)
 		c.Locals("user_type", userType)
 		c.Locals("tenant_id", tenantId)
+
+		// 3. Permission — 查权限
+		hasPermission, err := s.CheckPermission(c.Context(), userId, userType, tenantId, route)
+		if err != nil {
+			return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
+				"message": "Error checking permissions",
+			})
+		}
+		if !hasPermission {
+			return c.Status(fiber.StatusForbidden).JSON(fiber.Map{
+				"message": "Permission denied",
+			})
+		}
 
 		return c.Next()
 	}
